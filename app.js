@@ -1,0 +1,616 @@
+const SCRIP = {
+  symbol: "MCX MENTHAOIL",
+  lotSize: 360,
+  tickSize: 0.1,
+  expiry: "Current Contract"
+};
+
+const TOKEN_KEY = "mentha-session-token";
+
+const seedState = {
+  session: null,
+  master: { id: "MASTER", name: "Master" },
+  users: [],
+  orders: [],
+  trades: []
+};
+
+let state = structuredClone(seedState);
+let market = makeInitialMarket();
+let activeView = "trade";
+let activeSide = "BUY";
+let toastTimer = null;
+let refreshTimer = null;
+
+function apiBase() {
+  return window.MENTHA_API_BASE || "";
+}
+
+function token() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+async function api(path, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (token()) headers.Authorization = `Bearer ${token()}`;
+  const response = await fetch(`${apiBase()}${path}`, { ...options, headers });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Request failed ${response.status}`);
+  return data;
+}
+
+function fmt(n, d = 2) {
+  return Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
+}
+
+function whole(n) {
+  return Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 });
+}
+
+function signed(n) {
+  return `${n >= 0 ? "+" : ""}${fmt(n)}`;
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
+
+function makeInitialMarket() {
+  return {
+    ltp: 927.4,
+    prevClose: 921.8,
+    open: 922.3,
+    high: 931.2,
+    low: 918.9,
+    volume: 18420,
+    ltq: 72,
+    lastTick: Date.now(),
+    source: "demo",
+    bids: [
+      [927.3, 144],
+      [927.2, 216],
+      [927.1, 360],
+      [927.0, 504],
+      [926.9, 288]
+    ],
+    asks: [
+      [927.5, 180],
+      [927.6, 288],
+      [927.7, 432],
+      [927.8, 360],
+      [927.9, 540]
+    ]
+  };
+}
+
+function currentUser() {
+  if (!state.session) return null;
+  if (state.session.role === "master") return state.master;
+  return state.users.find((u) => u.id === state.session.id) || state.session;
+}
+
+function isMaster() {
+  return state.session?.role === "master";
+}
+
+function tradeMultiplier() {
+  return SCRIP.lotSize;
+}
+
+function userOrders(userId, includeAll = false) {
+  return state.orders
+    .filter((o) => includeAll || o.userId === userId)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+function userTrades(userId) {
+  return state.trades.filter((t) => t.userId === userId).sort((a, b) => new Date(b.time) - new Date(a.time));
+}
+
+function positionFor(userId) {
+  const lots = userTrades(userId);
+  let qty = 0;
+  let avg = 0;
+  let realized = 0;
+
+  for (const t of lots.slice().reverse()) {
+    const signedQty = t.side === "BUY" ? t.qty : -t.qty;
+    if (qty === 0 || Math.sign(qty) === Math.sign(signedQty)) {
+      avg = (Math.abs(qty) * avg + Math.abs(signedQty) * t.price) / (Math.abs(qty) + Math.abs(signedQty));
+      qty += signedQty;
+      continue;
+    }
+
+    const closingQty = Math.min(Math.abs(qty), Math.abs(signedQty));
+    const pnlPerUnit = qty > 0 ? t.price - avg : avg - t.price;
+    realized += pnlPerUnit * closingQty * tradeMultiplier();
+    qty += signedQty;
+
+    if (qty === 0) avg = 0;
+    if (qty !== 0 && Math.sign(qty) === Math.sign(signedQty)) avg = t.price;
+  }
+
+  const mtm = qty === 0 ? 0 : (qty > 0 ? market.ltp - avg : avg - market.ltp) * Math.abs(qty) * tradeMultiplier();
+  return { qty, avg, realized, mtm, net: realized + mtm };
+}
+
+function availableFunds(userId) {
+  const user = state.users.find((u) => u.id === userId);
+  if (!user) return 0;
+  const pos = positionFor(userId);
+  return Number(user.funds || 0) + pos.realized;
+}
+
+function normalizeMarket(data) {
+  const next = { ...market, ...data, lastTick: Date.now() };
+  next.ltp = Number(next.ltp || market.ltp);
+  next.prevClose = Number(next.prevClose || next.close || market.prevClose);
+  next.open = Number(next.open || market.open);
+  next.high = Number(next.high || Math.max(market.high, next.ltp));
+  next.low = Number(next.low || Math.min(market.low, next.ltp));
+  next.volume = Number(next.volume || market.volume);
+  next.ltq = Number(next.ltq || 0);
+  next.bids = Array.isArray(data.bids) && data.bids.length ? data.bids : market.bids;
+  next.asks = Array.isArray(data.asks) && data.asks.length ? data.asks : market.asks;
+  return next;
+}
+
+async function bootstrap() {
+  if (!token()) {
+    render();
+    return;
+  }
+
+  try {
+    await refreshState();
+    startRefresh();
+  } catch {
+    localStorage.removeItem(TOKEN_KEY);
+    state = structuredClone(seedState);
+    render();
+  }
+}
+
+function startRefresh() {
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => {
+    refreshState(false).catch(() => {});
+  }, 2500);
+}
+
+async function refreshState(showErrors = true) {
+  try {
+    const [stateData, marketData] = await Promise.all([
+      api("/api/state"),
+      api("/api/market")
+    ]);
+    state = { ...state, ...stateData };
+    market = normalizeMarket(marketData);
+    render();
+  } catch (error) {
+    if (showErrors) notify(error.message);
+    throw error;
+  }
+}
+
+function render() {
+  const app = document.getElementById("app");
+  if (!state.session) {
+    app.innerHTML = authTemplate();
+    bindAuth();
+    return;
+  }
+
+  app.innerHTML = shellTemplate();
+  bindShell();
+}
+
+function authTemplate() {
+  return `
+    <main class="auth">
+      <section class="auth-card">
+        <div class="mark">M</div>
+        <h1>MENTHA Paper Trade</h1>
+        <p class="muted">Render + Supabase paper trading for MCX Mentha Oil. Master ID: MASTER.</p>
+        <div class="trade-form" style="margin-top:16px">
+          <label class="field"><span class="label">Login ID</span><input id="loginId" autocomplete="username" value="MASTER"></label>
+          <label class="field"><span class="label">PIN</span><input id="loginPin" type="password" autocomplete="current-password"></label>
+          <button class="secondary" id="loginBtn">Log in</button>
+        </div>
+      </section>
+    </main>
+  `;
+}
+
+function shellTemplate() {
+  const user = currentUser();
+  const pos = isMaster() ? null : positionFor(user.id);
+  return `
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark">M</div>
+          <div>
+            <h1>${esc(SCRIP.symbol)}</h1>
+            <p>${esc(SCRIP.expiry)} · Lot ${SCRIP.lotSize}</p>
+          </div>
+        </div>
+        <button class="role-pill" id="logoutBtn">${isMaster() ? "Master" : esc(user.id)}</button>
+      </header>
+
+      <nav class="bottom-nav">
+        ${navButton("trade", "⇄", "Trade")}
+        ${navButton("orders", "≡", "Orders")}
+        ${navButton("funds", "₹", "Funds")}
+        ${navButton(isMaster() ? "admin" : "account", isMaster() ? "⚙" : "◉", isMaster() ? "Admin" : "Account")}
+      </nav>
+
+      <section class="grid main-layout">
+        <div class="grid">
+          ${marketTemplate()}
+          ${activeView === "trade" ? tradeTemplate(pos) : ""}
+          ${activeView === "orders" ? ordersTemplate() : ""}
+          ${activeView === "funds" ? fundsTemplate() : ""}
+          ${activeView === "admin" ? adminTemplate() : ""}
+          ${activeView === "account" ? accountTemplate(user, pos) : ""}
+        </div>
+        <aside class="grid">
+          ${depthTemplate()}
+          ${positionsTemplate()}
+        </aside>
+      </section>
+    </main>
+  `;
+}
+
+function navButton(view, icon, label) {
+  return `<button class="${activeView === view ? "active" : ""}" data-view="${esc(view)}"><span class="icon">${esc(icon)}</span><span>${esc(label)}</span></button>`;
+}
+
+function marketTemplate() {
+  const change = market.ltp - market.prevClose;
+  const pct = (change / market.prevClose) * 100;
+  return `
+    <section class="market-header">
+      <div class="quote-row">
+        <div>
+          <div class="price ${change >= 0 ? "up" : "down"}">${fmt(market.ltp, 1)}</div>
+          <p class="${change >= 0 ? "up" : "down"}">${signed(change)} (${signed(pct)}%)</p>
+        </div>
+        <span class="feed-pill">${market.source === "upstox" ? "Upstox live" : "Demo feed"}</span>
+      </div>
+      <div class="stats">
+        <div class="stat"><span class="label">Volume</span><span class="value">${whole(market.volume)}</span></div>
+        <div class="stat"><span class="label">LTQ</span><span class="value">${whole(market.ltq)}</span></div>
+        <div class="stat"><span class="label">Range</span><span class="value">${fmt(market.low, 1)}-${fmt(market.high, 1)}</span></div>
+      </div>
+    </section>
+  `;
+}
+
+function depthTemplate() {
+  const maxQty = Math.max(...market.bids.map((x) => x[1]), ...market.asks.map((x) => x[1]), 1);
+  const side = (rows, type) => rows.map(([price, qty]) => `
+    <div class="depth-line">
+      <div class="depth-bar ${type}-bg" style="width:${Math.max(8, (qty / maxQty) * 100)}%"></div>
+      <span class="${type === "buy" ? "up" : "down"}">${fmt(price, 1)}</span><span>${whole(qty)}</span>
+    </div>
+  `).join("");
+  return `
+    <section class="panel">
+      <div class="row"><h2>Market Depth</h2><span class="muted">Price / Qty</span></div>
+      <div class="depth">
+        <div class="depth-side">${side(market.bids, "buy")}</div>
+        <div class="depth-side">${side(market.asks, "sell")}</div>
+      </div>
+    </section>
+  `;
+}
+
+function tradeTemplate(pos) {
+  if (isMaster()) {
+    return `<section class="panel"><h2>Trade</h2><p class="muted">Master can supervise users, adjust funds, and void orders from Admin. Login as a trader to place practice trades.</p></section>`;
+  }
+  const lastQty = Math.max(1, Math.abs(pos?.qty || 1));
+  return `
+    <section class="panel">
+      <div class="row"><h2>Order Ticket</h2><span class="chip">Paper simulator</span></div>
+      <form class="trade-form" id="orderForm">
+        <div class="side-tabs">
+          <button type="button" class="seg ${activeSide === "BUY" ? "active" : ""}" data-side="BUY">Buy</button>
+          <button type="button" class="seg ${activeSide === "SELL" ? "active" : ""}" data-side="SELL">Sell</button>
+        </div>
+        <div class="form-grid">
+          <label class="field"><span class="label">Order type</span><select id="orderType"><option>MARKET</option><option>LIMIT</option></select></label>
+          <label class="field"><span class="label">Lots</span><input id="orderQty" type="number" min="1" step="1" value="${lastQty}"></label>
+        </div>
+        <label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="0.1" value="${fmt(activeSide === "BUY" ? market.asks[0][0] : market.bids[0][0], 1)}"></label>
+        <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(SCRIP.symbol)}</button>
+      </form>
+    </section>
+  `;
+}
+
+function ordersTemplate() {
+  const rows = userOrders(currentUser()?.id, isMaster());
+  return `
+    <section class="panel">
+      <div class="row"><h2>${isMaster() ? "All Orders" : "Orders"}</h2><span class="muted">${rows.length} total</span></div>
+      <div class="list">${rows.length ? rows.map(orderItem).join("") : empty("No orders yet")}</div>
+    </section>
+  `;
+}
+
+function orderItem(o) {
+  return `
+    <article class="item">
+      <div class="order-row">
+        <div><strong class="${o.side === "BUY" ? "up" : "down"}">${esc(o.side)} ${o.qty} lot</strong><br><small>${esc(o.userId)} · ${esc(o.type)} · ${new Date(o.createdAt).toLocaleString()}</small></div>
+        <span class="chip">${esc(o.status)}</span>
+      </div>
+      <div class="row" style="margin-top:8px"><span>${o.price ? fmt(o.price, 1) : "Market"}</span>${o.status === "OPEN" || isMaster() && o.status === "FILLED" ? `<button class="ghost" data-cancel="${esc(o.id)}">${o.status === "FILLED" ? "Void" : "Cancel"}</button>` : ""}</div>
+    </article>
+  `;
+}
+
+function fundsTemplate() {
+  if (isMaster()) {
+    return `
+      <section class="panel">
+        <h2>Funds Control</h2>
+        <div class="list">${state.users.map(userFundItem).join("")}</div>
+      </section>
+    `;
+  }
+  const user = currentUser();
+  const pos = positionFor(user.id);
+  return `
+    <section class="panel">
+      <h2>Funds</h2>
+      <div class="stats">
+        <div class="stat"><span class="label">Opening</span><span class="value">₹${whole(user.funds)}</span></div>
+        <div class="stat"><span class="label">Realized</span><span class="value ${pos.realized >= 0 ? "up" : "down"}">₹${signed(pos.realized)}</span></div>
+        <div class="stat"><span class="label">Available</span><span class="value">₹${whole(availableFunds(user.id))}</span></div>
+      </div>
+    </section>
+  `;
+}
+
+function userFundItem(u) {
+  return `
+    <article class="item">
+      <div class="admin-row"><div><strong>${esc(u.name)}</strong><br><small>${esc(u.id)} · ₹${whole(u.funds)}</small></div><span class="chip">${u.active ? "Active" : "Blocked"}</span></div>
+      <div class="form-grid" style="margin-top:10px">
+        <input id="fund-${esc(u.id)}" type="number" placeholder="Amount">
+        <button class="secondary" data-funds="${esc(u.id)}">Apply</button>
+      </div>
+    </article>
+  `;
+}
+
+function adminTemplate() {
+  return `
+    <section class="panel">
+      <h2>Create User</h2>
+      <form class="trade-form" id="userForm">
+        <div class="form-grid">
+          <label class="field"><span class="label">User ID</span><input id="newUserId" placeholder="TRADER2"></label>
+          <label class="field"><span class="label">PIN</span><input id="newUserPin" placeholder="4 digits"></label>
+        </div>
+        <label class="field"><span class="label">Name</span><input id="newUserName" placeholder="Trader name"></label>
+        <label class="field"><span class="label">Opening funds</span><input id="newUserFunds" type="number" value="500000"></label>
+        <button class="secondary">Create user</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>Users</h2>
+      <div class="list">${state.users.map(adminUserItem).join("")}</div>
+    </section>
+    <section class="panel">
+      <h2>Deployment</h2>
+      <p class="muted">Market data and all users/orders are now controlled by the Render backend and Supabase database. Configure Upstox token in Render environment variables.</p>
+    </section>
+  `;
+}
+
+function adminUserItem(u) {
+  const pos = positionFor(u.id);
+  return `
+    <article class="item">
+      <div class="admin-row">
+        <div><strong>${esc(u.name)}</strong><br><small>${esc(u.id)}</small></div>
+        <span class="${pos.net >= 0 ? "up" : "down"}">₹${signed(pos.net)}</span>
+      </div>
+      <div class="actions" style="margin-top:10px">
+        <button class="ghost" data-toggle="${esc(u.id)}">${u.active ? "Block" : "Unblock"}</button>
+        <button class="danger" data-remove="${esc(u.id)}">Remove</button>
+      </div>
+    </article>
+  `;
+}
+
+function accountTemplate(user, pos) {
+  return `
+    <section class="panel">
+      <h2>Account</h2>
+      <div class="stats">
+        <div class="stat"><span class="label">User</span><span class="value">${esc(user.id)}</span></div>
+        <div class="stat"><span class="label">Net Qty</span><span class="value">${pos.qty}</span></div>
+        <div class="stat"><span class="label">Avg</span><span class="value">${fmt(pos.avg, 1)}</span></div>
+      </div>
+      <button class="danger" id="logoutWide" style="width:100%;margin-top:12px">Log out</button>
+    </section>
+  `;
+}
+
+function positionsTemplate() {
+  const rows = isMaster() ? state.users.map((u) => ({ user: u, pos: positionFor(u.id) })) : [{ user: currentUser(), pos: positionFor(currentUser().id) }];
+  return `
+    <section class="panel">
+      <div class="row"><h2>Positions</h2><span class="muted">MTM live</span></div>
+      <div class="list">${rows.length ? rows.map(({ user, pos }) => `
+        <article class="item">
+          <div class="row"><strong>${esc(user.id)}</strong><span class="${pos.net >= 0 ? "up" : "down"}">₹${signed(pos.net)}</span></div>
+          <small>Qty ${pos.qty} · Avg ${fmt(pos.avg, 1)} · MTM ₹${signed(pos.mtm)}</small>
+        </article>
+      `).join("") : empty("No users yet")}</div>
+    </section>
+  `;
+}
+
+function empty(text) {
+  return `<p class="muted">${esc(text)}</p>`;
+}
+
+function bindAuth() {
+  document.getElementById("loginBtn").addEventListener("click", async () => {
+    const id = document.getElementById("loginId").value.trim().toUpperCase();
+    const pin = document.getElementById("loginPin").value.trim();
+    try {
+      const data = await api("/api/login", {
+        method: "POST",
+        body: JSON.stringify({ id, pin })
+      });
+      localStorage.setItem(TOKEN_KEY, data.token);
+      state.session = data.session;
+      activeView = data.session.role === "master" ? "admin" : "trade";
+      await refreshState();
+      startRefresh();
+    } catch (error) {
+      notify(error.message);
+    }
+  });
+}
+
+function bindShell() {
+  document.querySelectorAll("[data-view]").forEach((btn) => btn.addEventListener("click", () => {
+    activeView = btn.dataset.view;
+    render();
+  }));
+  document.getElementById("logoutBtn")?.addEventListener("click", logout);
+  document.getElementById("logoutWide")?.addEventListener("click", logout);
+  document.querySelectorAll("[data-side]").forEach((btn) => btn.addEventListener("click", () => {
+    activeSide = btn.dataset.side;
+    render();
+  }));
+  document.getElementById("orderForm")?.addEventListener("submit", placeOrder);
+  document.querySelectorAll("[data-cancel]").forEach((btn) => btn.addEventListener("click", () => cancelOrder(btn.dataset.cancel)));
+  document.getElementById("userForm")?.addEventListener("submit", createUser);
+  document.querySelectorAll("[data-toggle]").forEach((btn) => btn.addEventListener("click", () => toggleUser(btn.dataset.toggle)));
+  document.querySelectorAll("[data-remove]").forEach((btn) => btn.addEventListener("click", () => removeUser(btn.dataset.remove)));
+  document.querySelectorAll("[data-funds]").forEach((btn) => btn.addEventListener("click", () => applyFunds(btn.dataset.funds)));
+}
+
+function logout() {
+  clearInterval(refreshTimer);
+  localStorage.removeItem(TOKEN_KEY);
+  state = structuredClone(seedState);
+  render();
+}
+
+async function placeOrder(event) {
+  event.preventDefault();
+  const type = document.getElementById("orderType").value;
+  const qty = Math.floor(Number(document.getElementById("orderQty").value));
+  const price = Number(document.getElementById("orderPrice").value);
+  if (!qty || qty < 1) return notify("Enter at least 1 lot.");
+  if (type === "LIMIT" && !price) return notify("Enter a valid limit price.");
+
+  try {
+    await api("/api/orders", {
+      method: "POST",
+      body: JSON.stringify({ side: activeSide, type, qty, price })
+    });
+    activeView = "orders";
+    await refreshState();
+    notify("Order submitted.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function cancelOrder(orderId) {
+  try {
+    await api(`/api/orders/${encodeURIComponent(orderId)}/cancel`, { method: "POST" });
+    await refreshState();
+    notify(isMaster() ? "Order voided/cancelled." : "Order cancelled.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function createUser(event) {
+  event.preventDefault();
+  const id = document.getElementById("newUserId").value.trim().toUpperCase();
+  const pin = document.getElementById("newUserPin").value.trim();
+  const name = document.getElementById("newUserName").value.trim() || id;
+  const funds = Number(document.getElementById("newUserFunds").value);
+  try {
+    await api("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ id, pin, name, funds })
+    });
+    await refreshState();
+    notify("User created.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function toggleUser(id) {
+  const user = state.users.find((u) => u.id === id);
+  if (!user) return;
+  try {
+    await api(`/api/users/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ active: !user.active })
+    });
+    await refreshState();
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function removeUser(id) {
+  try {
+    await api(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await refreshState();
+    notify("User removed.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function applyFunds(id) {
+  const input = document.getElementById(`fund-${id}`);
+  const amount = Number(input.value);
+  if (!amount) return notify("Enter a positive or negative amount.");
+  try {
+    await api(`/api/users/${encodeURIComponent(id)}/funds`, {
+      method: "POST",
+      body: JSON.stringify({ amount })
+    });
+    await refreshState();
+    notify(`Funds updated for ${id}.`);
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+function notify(message) {
+  clearTimeout(toastTimer);
+  document.querySelector(".toast")?.remove();
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = message;
+  document.body.appendChild(el);
+  toastTimer = setTimeout(() => el.remove(), 2600);
+}
+
+bootstrap();
