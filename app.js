@@ -10,7 +10,9 @@ const TOKEN_KEY = "mentha-session-token";
 const seedState = {
   session: null,
   master: { id: "MASTER", name: "Master" },
-  users: [],
+  users: [
+    { id: "TRADER1", pin: "1111", name: "Trader 1", funds: 500000, active: true, createdAt: new Date().toISOString() }
+  ],
   orders: [],
   trades: []
 };
@@ -21,6 +23,7 @@ let activeView = "trade";
 let activeSide = "BUY";
 let toastTimer = null;
 let refreshTimer = null;
+let localMarketTimer = null;
 
 function apiBase() {
   return window.MENTHA_API_BASE || "";
@@ -31,12 +34,183 @@ function token() {
 }
 
 async function api(path, options = {}) {
+  if (window.MENTHA_LOCAL_ONLY) return localApi(path, options);
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (token()) headers.Authorization = `Bearer ${token()}`;
   const response = await fetch(`${apiBase()}${path}`, { ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed ${response.status}`);
   return data;
+}
+
+function localStore() {
+  try {
+    return JSON.parse(localStorage.getItem("mentha-local-db") || "null") || structuredClone(seedState);
+  } catch {
+    return structuredClone(seedState);
+  }
+}
+
+function saveLocalStore(db) {
+  localStorage.setItem("mentha-local-db", JSON.stringify(db));
+}
+
+function localSession() {
+  try {
+    return JSON.parse(localStorage.getItem("mentha-local-session") || "null");
+  } catch {
+    return null;
+  }
+}
+
+function saveLocalSession(session) {
+  if (session) localStorage.setItem("mentha-local-session", JSON.stringify(session));
+  else localStorage.removeItem("mentha-local-session");
+}
+
+function localId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+}
+
+function localExecutablePrice(order) {
+  if (order.type === "MARKET") return order.side === "BUY" ? market.asks[0][0] : market.bids[0][0];
+  if (order.side === "BUY" && Number(order.price) >= market.asks[0][0]) return market.asks[0][0];
+  if (order.side === "SELL" && Number(order.price) <= market.bids[0][0]) return market.bids[0][0];
+  return null;
+}
+
+function localFillOrder(db, order) {
+  const fillPrice = localExecutablePrice(order);
+  if (!fillPrice) return;
+  order.status = "FILLED";
+  order.fillPrice = fillPrice;
+  order.filledAt = new Date().toISOString();
+  db.trades.push({
+    id: localId("TRD"),
+    orderId: order.id,
+    userId: order.userId,
+    side: order.side,
+    qty: order.qty,
+    price: fillPrice,
+    time: new Date().toISOString()
+  });
+}
+
+async function localApi(path, options = {}) {
+  const db = localStore();
+  const method = String(options.method || "GET").toUpperCase();
+  const body = options.body ? JSON.parse(options.body) : {};
+  const session = localSession();
+
+  if (path === "/api/login" && method === "POST") {
+    const id = String(body.id || "").trim().toUpperCase();
+    const pin = String(body.pin || "").trim();
+    if (id === "MASTER" && pin === "1234") {
+      const masterSession = { role: "master", id: "MASTER", name: "Master" };
+      saveLocalSession(masterSession);
+      return { token: "local", session: masterSession };
+    }
+    const user = db.users.find((u) => u.id === id && u.pin === pin && u.active);
+    if (!user) throw new Error("Invalid login or blocked user.");
+    const userSession = { role: "user", id: user.id, name: user.name };
+    saveLocalSession(userSession);
+    return { token: "local", session: userSession };
+  }
+
+  if (!session) throw new Error("Login required.");
+
+  if (path === "/api/state") {
+    if (session.role === "master") return { ...db, session, master: seedState.master };
+    return {
+      session,
+      master: seedState.master,
+      users: db.users.filter((u) => u.id === session.id),
+      orders: db.orders.filter((o) => o.userId === session.id),
+      trades: db.trades.filter((t) => t.userId === session.id)
+    };
+  }
+
+  if (path === "/api/market") return { ...market, source: "demo" };
+
+  if (path === "/api/users" && method === "POST") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const id = String(body.id || "").trim().toUpperCase();
+    if (!/^[A-Z0-9_-]{3,20}$/.test(id)) throw new Error("Use 3-20 letters, numbers, _ or - for user ID.");
+    if (db.users.some((u) => u.id === id) || id === "MASTER") throw new Error("That user ID already exists.");
+    db.users.push({
+      id,
+      pin: String(body.pin || "").trim(),
+      name: String(body.name || id).trim(),
+      funds: Number(body.funds || 0),
+      active: true,
+      createdAt: new Date().toISOString()
+    });
+    saveLocalStore(db);
+    return { ok: true };
+  }
+
+  const userPatch = path.match(/^\/api\/users\/([^/]+)$/);
+  if (userPatch && method === "PATCH") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const user = db.users.find((u) => u.id === decodeURIComponent(userPatch[1]).toUpperCase());
+    if (!user) throw new Error("User not found.");
+    if (typeof body.active === "boolean") user.active = body.active;
+    if (body.name) user.name = String(body.name).trim();
+    saveLocalStore(db);
+    return { ok: true };
+  }
+
+  if (userPatch && method === "DELETE") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const id = decodeURIComponent(userPatch[1]).toUpperCase();
+    db.users = db.users.filter((u) => u.id !== id);
+    db.orders = db.orders.map((o) => o.userId === id && o.status === "OPEN" ? { ...o, status: "CANCELLED", cancelledAt: new Date().toISOString() } : o);
+    saveLocalStore(db);
+    return { ok: true };
+  }
+
+  const fundsPatch = path.match(/^\/api\/users\/([^/]+)\/funds$/);
+  if (fundsPatch && method === "POST") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const user = db.users.find((u) => u.id === decodeURIComponent(fundsPatch[1]).toUpperCase());
+    if (!user) throw new Error("User not found.");
+    user.funds = Number(user.funds || 0) + Number(body.amount || 0);
+    saveLocalStore(db);
+    return { ok: true };
+  }
+
+  if (path === "/api/orders" && method === "POST") {
+    if (session.role !== "user") throw new Error("Login as a trader to place orders.");
+    const order = {
+      id: localId("ORD"),
+      userId: session.id,
+      side: String(body.side || "").toUpperCase(),
+      type: String(body.type || "").toUpperCase(),
+      qty: Math.floor(Number(body.qty || 0)),
+      price: body.type === "MARKET" ? null : Number(body.price || 0),
+      status: "OPEN",
+      createdAt: new Date().toISOString()
+    };
+    localFillOrder(db, order);
+    db.orders.push(order);
+    saveLocalStore(db);
+    return { order };
+  }
+
+  const cancelPatch = path.match(/^\/api\/orders\/([^/]+)\/cancel$/);
+  if (cancelPatch && method === "POST") {
+    const order = db.orders.find((o) => o.id === decodeURIComponent(cancelPatch[1]));
+    if (!order) throw new Error("Order not found.");
+    if (session.role !== "master" && order.userId !== session.id) throw new Error("Cannot cancel this order.");
+    if (order.status === "FILLED" && session.role !== "master") throw new Error("Filled orders cannot be cancelled by trader.");
+    if (order.status === "FILLED" && session.role === "master") db.trades = db.trades.filter((t) => t.orderId !== order.id);
+    order.status = "CANCELLED";
+    order.cancelledAt = new Date().toISOString();
+    saveLocalStore(db);
+    return { order };
+  }
+
+  throw new Error("Local endpoint not found.");
 }
 
 function fmt(n, d = 2) {
@@ -162,6 +336,18 @@ function normalizeMarket(data) {
 }
 
 async function bootstrap() {
+  if (window.MENTHA_LOCAL_ONLY) {
+    state.session = localSession();
+    startLocalMarket();
+    if (state.session) {
+      await refreshState();
+      startRefresh();
+    } else {
+      render();
+    }
+    return;
+  }
+
   if (!token()) {
     render();
     return;
@@ -175,6 +361,30 @@ async function bootstrap() {
     state = structuredClone(seedState);
     render();
   }
+}
+
+function startLocalMarket() {
+  clearInterval(localMarketTimer);
+  localMarketTimer = setInterval(() => {
+    const next = Math.max(700, roundTick(market.ltp + (Math.random() - 0.48) * 1.6));
+    const spread = 0.2 + (Math.random() > 0.7 ? 0.1 : 0);
+    market = {
+      ...market,
+      ltp: next,
+      high: Math.max(market.high, next),
+      low: Math.min(market.low, next),
+      ltq: [36, 72, 108, 144, 216, 360][Math.floor(Math.random() * 6)],
+      volume: market.volume + market.ltq,
+      bids: Array.from({ length: 5 }, (_, i) => [roundTick(next - spread / 2 - i * 0.1), 72 * (2 + Math.floor(Math.random() * 7))]),
+      asks: Array.from({ length: 5 }, (_, i) => [roundTick(next + spread / 2 + i * 0.1), 72 * (2 + Math.floor(Math.random() * 7))]),
+      source: "demo"
+    };
+    if (state.session) renderIfNotEditing();
+  }, 1800);
+}
+
+function roundTick(value) {
+  return Math.round(value / SCRIP.tickSize) * SCRIP.tickSize;
 }
 
 function startRefresh() {
@@ -192,11 +402,22 @@ async function refreshState(showErrors = true) {
     ]);
     state = { ...state, ...stateData };
     market = normalizeMarket(marketData);
-    render();
+    renderIfNotEditing();
   } catch (error) {
     if (showErrors) notify(error.message);
     throw error;
   }
+}
+
+function isEditingField() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+}
+
+function renderIfNotEditing() {
+  if (!isEditingField()) render();
 }
 
 function render() {
@@ -510,6 +731,7 @@ function bindShell() {
 function logout() {
   clearInterval(refreshTimer);
   localStorage.removeItem(TOKEN_KEY);
+  if (window.MENTHA_LOCAL_ONLY) saveLocalSession(null);
   state = structuredClone(seedState);
   render();
 }
