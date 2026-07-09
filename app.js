@@ -15,6 +15,7 @@ const seedState = {
   ],
   orders: [],
   trades: [],
+  ledger: [],
   settings: { brokeragePerLot: 0, marginPerLot: 0 }
 };
 
@@ -169,6 +170,15 @@ async function localApi(path, options = {}) {
       active: true,
       createdAt: new Date().toISOString()
     });
+    db.ledger = db.ledger || [];
+    db.ledger.push({
+      id: localId("LED"),
+      userId: id,
+      type: "OPENING",
+      amount: Number(body.funds || 0),
+      note: "Opening balance",
+      time: new Date().toISOString()
+    });
     saveLocalStore(db);
     return { ok: true };
   }
@@ -199,6 +209,15 @@ async function localApi(path, options = {}) {
     const user = db.users.find((u) => u.id === decodeURIComponent(fundsPatch[1]).toUpperCase());
     if (!user) throw new Error("User not found.");
     user.funds = Number(user.funds || 0) + Number(body.amount || 0);
+    db.ledger = db.ledger || [];
+    db.ledger.push({
+      id: localId("LED"),
+      userId: user.id,
+      type: Number(body.amount || 0) > 0 ? "ADD" : "REMOVE",
+      amount: Number(body.amount || 0),
+      note: Number(body.amount || 0) > 0 ? "Funds added by master" : "Funds removed by master",
+      time: new Date().toISOString()
+    });
     saveLocalStore(db);
     return { ok: true };
   }
@@ -319,11 +338,16 @@ function userTrades(userId) {
 }
 
 function positionFor(userId) {
+  return positionReport(userId).summary;
+}
+
+function positionReport(userId) {
   const lots = userTrades(userId);
   let qty = 0;
   let avg = 0;
   let realized = 0;
   let brokerage = 0;
+  const closed = [];
 
   for (const t of lots.slice().reverse()) {
     const signedQty = t.side === "BUY" ? t.qty : -t.qty;
@@ -336,7 +360,20 @@ function positionFor(userId) {
 
     const closingQty = Math.min(Math.abs(qty), Math.abs(signedQty));
     const pnlPerUnit = qty > 0 ? t.price - avg : avg - t.price;
-    realized += pnlPerUnit * closingQty * tradeMultiplier();
+    const grossPnl = pnlPerUnit * closingQty * tradeMultiplier();
+    realized += grossPnl;
+    closed.push({
+      id: t.id,
+      userId: t.userId,
+      side: qty > 0 ? "LONG" : "SHORT",
+      qty: closingQty,
+      entry: avg,
+      exit: t.price,
+      pnl: grossPnl - Number(t.brokerage || 0),
+      grossPnl,
+      brokerage: Number(t.brokerage || 0),
+      time: t.time
+    });
     qty += signedQty;
 
     if (qty === 0) avg = 0;
@@ -345,7 +382,19 @@ function positionFor(userId) {
 
   const mtm = qty === 0 ? 0 : (qty > 0 ? market.ltp - avg : avg - market.ltp) * Math.abs(qty) * tradeMultiplier();
   realized -= brokerage;
-  return { qty, avg, realized, mtm, net: realized + mtm, brokerage };
+  const open = qty === 0 ? [] : [{
+    userId,
+    side: qty > 0 ? "LONG" : "SHORT",
+    qty: Math.abs(qty),
+    avg,
+    ltp: market.ltp,
+    pnl: mtm
+  }];
+  return {
+    summary: { qty, avg, realized, mtm, net: realized + mtm, brokerage },
+    open,
+    closed
+  };
 }
 
 function availableFunds(userId) {
@@ -499,6 +548,7 @@ function authTemplate() {
 function shellTemplate() {
   const user = currentUser();
   const pos = isMaster() ? null : positionFor(user.id);
+  const content = viewTemplate(user, pos);
   return `
     <main class="shell">
       <header class="topbar">
@@ -514,38 +564,36 @@ function shellTemplate() {
 
       <nav class="bottom-nav">
         ${navButton("trade", "⇄", "Trade")}
+        ${navButton("positions", "◫", "Positions")}
         ${navButton("orders", "≡", "Orders")}
-        ${navButton("funds", "₹", "Funds")}
-        ${navButton(isMaster() ? "admin" : "account", isMaster() ? "⚙" : "◉", isMaster() ? "Admin" : "Account")}
+        ${navButton(isMaster() ? "admin" : "account", isMaster() ? "⚙" : "₹", isMaster() ? "Admin" : "Account")}
       </nav>
 
-      <section class="grid main-layout">
-        <div class="grid">
-          ${marketTemplate()}
-          ${activeView === "trade" ? tradeTemplate(pos) : ""}
-          ${activeView === "orders" ? ordersTemplate() : ""}
-          ${activeView === "funds" ? fundsTemplate() : ""}
-          ${activeView === "admin" ? adminTemplate() : ""}
-          ${activeView === "account" ? accountTemplate(user, pos) : ""}
-        </div>
-        <aside class="grid">
-          ${depthTemplate()}
-          ${positionsTemplate()}
-        </aside>
+      <section class="grid ${activeView === "trade" ? "trade-stack" : ""}">
+        ${content}
       </section>
     </main>
   `;
+}
+
+function viewTemplate(user, pos) {
+  if (activeView === "trade") return `${marketTemplate(true)}${depthTemplate()}${tradeTemplate(pos)}`;
+  if (activeView === "positions") return positionsPageTemplate();
+  if (activeView === "orders") return ordersTemplate();
+  if (activeView === "admin") return adminTemplate();
+  if (activeView === "account" || activeView === "funds") return accountLedgerTemplate(user, pos);
+  return tradeTemplate(pos);
 }
 
 function navButton(view, icon, label) {
   return `<button class="${activeView === view ? "active" : ""}" data-view="${esc(view)}"><span class="icon">${esc(icon)}</span><span>${esc(label)}</span></button>`;
 }
 
-function marketTemplate() {
+function marketTemplate(pulse = false) {
   const change = market.ltp - market.prevClose;
   const pct = (change / market.prevClose) * 100;
   return `
-    <section class="market-header">
+    <section class="market-header ${pulse ? "pulse-board" : ""}">
       <div class="quote-row">
         <div>
           <div class="price ${change >= 0 ? "up" : "down"}">${fmt(market.ltp, 1)}</div>
@@ -721,32 +769,153 @@ function adminUserItem(u) {
   `;
 }
 
-function accountTemplate(user, pos) {
+function accountLedgerTemplate(user, pos) {
+  if (isMaster()) return adminTemplate();
+  const ledger = ledgerRowsFor(user.id, pos);
   return `
     <section class="panel">
       <h2>Account</h2>
       <div class="stats">
         <div class="stat"><span class="label">User</span><span class="value">${esc(user.id)}</span></div>
-        <div class="stat"><span class="label">Net Qty</span><span class="value">${pos.qty}</span></div>
-        <div class="stat"><span class="label">Avg</span><span class="value">${fmt(pos.avg, 1)}</span></div>
+        <div class="stat"><span class="label">Available</span><span class="value">₹${whole(availableFunds(user.id))}</span></div>
+        <div class="stat"><span class="label">Used Margin</span><span class="value">₹${whole(usedMargin(user.id))}</span></div>
+      </div>
+      <div class="stats" style="margin-top:8px">
+        <div class="stat"><span class="label">Opening</span><span class="value">₹${whole(openingBalance(user.id))}</span></div>
+        <div class="stat"><span class="label">Brokerage</span><span class="value">₹${whole(pos.brokerage)}</span></div>
+        <div class="stat"><span class="label">Total P&L</span><span class="value ${pos.net >= 0 ? "up" : "down"}">₹${signed(pos.net)}</span></div>
       </div>
       <button class="danger" id="logoutWide" style="width:100%;margin-top:12px">Log out</button>
+    </section>
+    <section class="panel">
+      <div class="row"><h2>Ledger</h2><span class="muted">${ledger.length} entries</span></div>
+      <div class="list">${ledger.length ? ledger.map(ledgerItem).join("") : empty("No ledger entries yet")}</div>
     </section>
   `;
 }
 
-function positionsTemplate() {
-  const rows = isMaster() ? state.users.map((u) => ({ user: u, pos: positionFor(u.id) })) : [{ user: currentUser(), pos: positionFor(currentUser().id) }];
+function positionsPageTemplate() {
+  const rows = isMaster()
+    ? state.users.map((u) => ({ user: u, report: positionReport(u.id) }))
+    : [{ user: currentUser(), report: positionReport(currentUser().id) }];
+  const total = rows.reduce((sum, row) => sum + row.report.summary.net, 0);
+  const openPnl = rows.reduce((sum, row) => sum + row.report.summary.mtm, 0);
+  const closedPnl = rows.reduce((sum, row) => sum + row.report.summary.realized, 0);
+  const openRows = rows.flatMap(({ user, report }) => report.open.map((item) => ({ ...item, userId: user.id })));
+  const closedRows = rows.flatMap(({ user, report }) => report.closed.map((item) => ({ ...item, userId: user.id })));
   return `
     <section class="panel">
-      <div class="row"><h2>Positions</h2><span class="muted">MTM live</span></div>
-      <div class="list">${rows.length ? rows.map(({ user, pos }) => `
-        <article class="item">
-          <div class="row"><strong>${esc(user.id)}</strong><span class="${pos.net >= 0 ? "up" : "down"}">₹${signed(pos.net)}</span></div>
-          <small>Qty ${pos.qty} · Avg ${fmt(pos.avg, 1)} · MTM ₹${signed(pos.mtm)}</small>
-        </article>
-      `).join("") : empty("No users yet")}</div>
+      <span class="label">Total P&L</span>
+      <div class="pnl-hero ${total >= 0 ? "up" : "down"}">₹${signed(total)}</div>
+      <div class="stats">
+        <div class="stat"><span class="label">Open P&L</span><span class="value ${openPnl >= 0 ? "up" : "down"}">₹${signed(openPnl)}</span></div>
+        <div class="stat"><span class="label">Closed P&L</span><span class="value ${closedPnl >= 0 ? "up" : "down"}">₹${signed(closedPnl)}</span></div>
+        <div class="stat"><span class="label">Brokerage</span><span class="value">₹${whole(rows.reduce((sum, row) => sum + row.report.summary.brokerage, 0))}</span></div>
+      </div>
     </section>
+    <section class="panel">
+      <div class="row"><h2>Open Positions</h2><span class="muted">${openRows.length} rows</span></div>
+      <div class="list">${openRows.length ? openRows.map(openPositionItem).join("") : empty("No open positions")}</div>
+    </section>
+    <section class="panel">
+      <div class="row"><h2>Closed Positions</h2><span class="muted">${closedRows.length} rows</span></div>
+      <div class="list">${closedRows.length ? closedRows.map(closedPositionItem).join("") : empty("No closed positions")}</div>
+    </section>
+  `;
+}
+
+function openPositionItem(item) {
+  return `
+    <article class="item">
+      <div class="row"><strong>${esc(item.userId)} · ${esc(item.side)} ${item.qty}</strong><span class="${item.pnl >= 0 ? "up" : "down"}">₹${signed(item.pnl)}</span></div>
+      <small>Avg ${fmt(item.avg, 1)} · LTP ${fmt(item.ltp, 1)}</small>
+    </article>
+  `;
+}
+
+function closedPositionItem(item) {
+  return `
+    <article class="item">
+      <div class="row"><strong>${esc(item.userId)} · ${esc(item.side)} ${item.qty}</strong><span class="${item.pnl >= 0 ? "up" : "down"}">₹${signed(item.pnl)}</span></div>
+      <small>Entry ${fmt(item.entry, 1)} · Exit ${fmt(item.exit, 1)} · Brokerage ₹${whole(item.brokerage)} · ${new Date(item.time).toLocaleString()}</small>
+    </article>
+  `;
+}
+
+function openingBalance(userId) {
+  const opening = (state.ledger || []).find((item) => item.userId === userId && item.type === "OPENING");
+  if (opening) return opening.amount;
+  const user = state.users.find((u) => u.id === userId);
+  return Number(user?.funds || 0);
+}
+
+function ledgerRowsFor(userId, pos) {
+  const rawFundRows = (state.ledger || [])
+    .filter((item) => item.userId === userId);
+  const hasOpening = rawFundRows.some((item) => item.type === "OPENING");
+  const user = state.users.find((item) => item.id === userId);
+  const fallbackOpening = hasOpening ? [] : [{
+    id: `${userId}-opening-fallback`,
+    userId,
+    type: "OPENING",
+    amount: Number(user?.funds || 0),
+    note: "Opening balance",
+    time: user?.createdAt || new Date().toISOString()
+  }];
+
+  const fundRows = [...fallbackOpening, ...rawFundRows]
+    .filter((item) => item.userId === userId)
+    .map((item) => ({
+      id: item.id,
+      time: item.time,
+      title: item.type === "OPENING" ? "Opening balance" : item.type === "ADD" ? "Funds added" : "Funds removed",
+      note: item.note,
+      amount: item.amount,
+      kind: item.amount >= 0 ? "credit" : "debit"
+    }));
+
+  const brokerageRows = userTrades(userId)
+    .filter((trade) => Number(trade.brokerage || 0) > 0)
+    .map((trade) => ({
+      id: `${trade.id}-brokerage`,
+      time: trade.time,
+      title: "Brokerage charged",
+      note: `${trade.side} ${trade.qty} lot at ${fmt(trade.price, 1)}`,
+      amount: -Number(trade.brokerage || 0),
+      kind: "debit"
+    }));
+
+  const pnlRows = positionReport(userId).closed.map((item) => ({
+    id: `${item.id}-pnl`,
+    time: item.time,
+    title: "Trade P&L",
+    note: `${item.side} ${item.qty} lot · Entry ${fmt(item.entry, 1)} · Exit ${fmt(item.exit, 1)}`,
+    amount: item.grossPnl,
+    kind: item.grossPnl >= 0 ? "credit" : "debit"
+  }));
+
+  const openPnlRow = pos.mtm === 0 ? [] : [{
+    id: "open-pnl",
+    time: new Date().toISOString(),
+    title: "Open P&L",
+    note: "Live mark-to-market",
+    amount: pos.mtm,
+    kind: pos.mtm >= 0 ? "credit" : "debit"
+  }];
+
+  return [...openPnlRow, ...pnlRows, ...brokerageRows, ...fundRows]
+    .sort((a, b) => new Date(b.time) - new Date(a.time));
+}
+
+function ledgerItem(item) {
+  return `
+    <article class="item">
+      <div class="row">
+        <strong>${esc(item.title)}</strong>
+        <span class="${item.amount >= 0 ? "up" : "down"}">₹${signed(item.amount)}</span>
+      </div>
+      <small>${esc(item.note || "")}${item.note ? " · " : ""}${new Date(item.time).toLocaleString()}</small>
+    </article>
   `;
 }
 

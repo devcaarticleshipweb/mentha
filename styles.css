@@ -107,6 +107,29 @@ button {
   box-shadow: var(--shadow);
 }
 
+.pulse-board {
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(135deg, rgba(32, 199, 122, 0.12), transparent 45%),
+    linear-gradient(315deg, rgba(84, 167, 255, 0.12), transparent 45%),
+    var(--panel);
+}
+
+.pulse-board::after {
+  content: "";
+  position: absolute;
+  inset: -40%;
+  background: radial-gradient(circle, rgba(84, 167, 255, 0.16), transparent 42%);
+  animation: pricePulse 2.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pulse-board > * {
+  position: relative;
+  z-index: 1;
+}
+
 .quote-row,
 .spread-row,
 .row,
@@ -122,6 +145,17 @@ button {
   font-size: clamp(34px, 12vw, 54px);
   line-height: 0.95;
   font-weight: 850;
+  letter-spacing: 0;
+}
+
+.pulse-board .price {
+  font-size: clamp(48px, 18vw, 88px);
+}
+
+.pnl-hero {
+  font-size: clamp(38px, 15vw, 72px);
+  line-height: 1;
+  font-weight: 900;
   letter-spacing: 0;
 }
 
@@ -422,5 +456,17 @@ button {
     margin: 0 auto 12px;
     border: 1px solid var(--line);
     border-radius: 8px;
+  }
+}
+
+@keyframes pricePulse {
+  0%,
+  100% {
+    transform: scale(0.9);
+    opacity: 0.35;
+  }
+  50% {
+    transform: scale(1.1);
+    opacity: 0.85;
   }
 }

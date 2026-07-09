@@ -15,6 +15,7 @@ This version is ready for Render + Supabase.
 Keep the service role key secret. It goes only in Render environment variables.
 
 If you already deployed an older version, run `supabase-schema.sql` again. It safely adds the new brokerage, margin, and settings fields.
+The latest schema also adds `fund_ledger`, used for opening balance and fund addition/removal history.
 
 ## 2. Push Project To GitHub
 
@@ -80,6 +81,12 @@ Order behavior:
 - Market sell fills immediately at the first buy/bid in market depth.
 - Buy limit fills when LTP is at or below the limit price.
 - Sell limit fills when LTP is at or above the limit price.
+
+Pages:
+
+- Trade: pulse price, market depth, then order ticket.
+- Positions: total P&L, open P&L, closed P&L, open positions, then closed positions.
+- Account: funds, margin, brokerage, and ledger entries.
 
 ## Notes
 

@@ -111,6 +111,17 @@ function publicTrade(row) {
   };
 }
 
+function publicLedger(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    type: row.type,
+    amount: Number(row.amount || 0),
+    note: row.note || "",
+    time: row.created_at
+  };
+}
+
 function publicSettings(row = {}) {
   return {
     brokeragePerLot: Number(row.brokerage_per_lot || 0),
@@ -322,10 +333,11 @@ app.get("/api/state", requireAuth, async (req, res) => {
   try {
     const settings = await ensureSettings();
     if (req.session.role === "master") {
-      const [users, orders, trades] = await Promise.all([
+      const [users, orders, trades, ledger] = await Promise.all([
         db(supabase.from("app_users").select("*").order("created_at", { ascending: false })),
         db(supabase.from("orders").select("*").order("created_at", { ascending: false }).limit(500)),
-        db(supabase.from("trades").select("*").order("created_at", { ascending: false }).limit(500))
+        db(supabase.from("trades").select("*").order("created_at", { ascending: false }).limit(500)),
+        db(supabase.from("fund_ledger").select("*").order("created_at", { ascending: false }).limit(500))
       ]);
       return res.json({
         session: req.session,
@@ -333,14 +345,16 @@ app.get("/api/state", requireAuth, async (req, res) => {
         users: users.map(publicUser),
         orders: orders.map(publicOrder),
         trades: trades.map(publicTrade),
+        ledger: ledger.map(publicLedger),
         settings
       });
     }
 
-    const [user, orders, trades] = await Promise.all([
+    const [user, orders, trades, ledger] = await Promise.all([
       db(supabase.from("app_users").select("*").eq("id", req.session.id).single()),
       db(supabase.from("orders").select("*").eq("user_id", req.session.id).order("created_at", { ascending: false }).limit(200)),
-      db(supabase.from("trades").select("*").eq("user_id", req.session.id).order("created_at", { ascending: false }).limit(200))
+      db(supabase.from("trades").select("*").eq("user_id", req.session.id).order("created_at", { ascending: false }).limit(200)),
+      db(supabase.from("fund_ledger").select("*").eq("user_id", req.session.id).order("created_at", { ascending: false }).limit(200))
     ]);
     res.json({
       session: req.session,
@@ -348,6 +362,7 @@ app.get("/api/state", requireAuth, async (req, res) => {
       users: [publicUser(user)],
       orders: orders.map(publicOrder),
       trades: trades.map(publicTrade),
+      ledger: ledger.map(publicLedger),
       settings
     });
   } catch (error) {
@@ -398,6 +413,12 @@ app.post("/api/users", requireAuth, requireMaster, async (req, res) => {
       pin_hash: hashPin(pin, salt),
       active: true
     }).select().single());
+    await db(supabase.from("fund_ledger").insert({
+      user_id: id,
+      type: "OPENING",
+      amount: funds,
+      note: "Opening balance"
+    }));
     res.status(201).json({ user: publicUser(inserted) });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -424,6 +445,12 @@ app.post("/api/users/:id/funds", requireAuth, requireMaster, async (req, res) =>
     if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: "Enter a valid amount." });
     const user = await db(supabase.from("app_users").select("*").eq("id", id).single());
     const updated = await db(supabase.from("app_users").update({ funds: Number(user.funds) + amount }).eq("id", id).select().single());
+    await db(supabase.from("fund_ledger").insert({
+      user_id: id,
+      type: amount > 0 ? "ADD" : "REMOVE",
+      amount,
+      note: amount > 0 ? "Funds added by master" : "Funds removed by master"
+    }));
     res.json({ user: publicUser(updated) });
   } catch (error) {
     res.status(400).json({ error: error.message });
