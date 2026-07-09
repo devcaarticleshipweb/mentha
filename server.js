@@ -45,6 +45,7 @@ const demoMarket = {
 
 let market = { ...demoMarket };
 let lastMarketError = null;
+let cachedSettings = { brokeragePerLot: 0, marginPerLot: 0 };
 
 function base64url(input) {
   return Buffer.from(input).toString("base64url");
@@ -105,7 +106,15 @@ function publicTrade(row) {
     side: row.side,
     qty: Number(row.qty),
     price: Number(row.price),
+    brokerage: Number(row.brokerage || 0),
     time: row.created_at
+  };
+}
+
+function publicSettings(row = {}) {
+  return {
+    brokeragePerLot: Number(row.brokerage_per_lot || 0),
+    marginPerLot: Number(row.margin_per_lot || 0)
   };
 }
 
@@ -134,14 +143,70 @@ function roundTick(value) {
 
 function executablePrice(order) {
   if (order.type === "MARKET") return order.side === "BUY" ? market.asks[0][0] : market.bids[0][0];
-  if (order.side === "BUY" && Number(order.price) >= market.asks[0][0]) return market.asks[0][0];
-  if (order.side === "SELL" && Number(order.price) <= market.bids[0][0]) return market.bids[0][0];
+  if (order.side === "BUY" && market.ltp <= Number(order.price)) return Number(order.price);
+  if (order.side === "SELL" && market.ltp >= Number(order.price)) return Number(order.price);
   return null;
 }
 
+async function ensureSettings() {
+  const row = await db(supabase.from("app_settings").select("*").eq("id", 1).maybeSingle());
+  if (row) {
+    cachedSettings = publicSettings(row);
+    return cachedSettings;
+  }
+  const inserted = await db(supabase.from("app_settings").insert({ id: 1 }).select().single());
+  cachedSettings = publicSettings(inserted);
+  return cachedSettings;
+}
+
+function calculatePosition(trades) {
+  let qty = 0;
+  let avg = 0;
+  let realized = 0;
+  let brokerage = 0;
+
+  for (const trade of trades.slice().reverse()) {
+    const tradeQty = Number(trade.qty || 0);
+    const tradePrice = Number(trade.price || 0);
+    const signedQty = trade.side === "BUY" ? tradeQty : -tradeQty;
+    brokerage += Number(trade.brokerage || 0);
+
+    if (qty === 0 || Math.sign(qty) === Math.sign(signedQty)) {
+      avg = (Math.abs(qty) * avg + Math.abs(signedQty) * tradePrice) / (Math.abs(qty) + Math.abs(signedQty));
+      qty += signedQty;
+      continue;
+    }
+
+    const closingQty = Math.min(Math.abs(qty), Math.abs(signedQty));
+    const pnlPerUnit = qty > 0 ? tradePrice - avg : avg - tradePrice;
+    realized += pnlPerUnit * closingQty * 360;
+    qty += signedQty;
+
+    if (qty === 0) avg = 0;
+    if (qty !== 0 && Math.sign(qty) === Math.sign(signedQty)) avg = tradePrice;
+  }
+
+  return { qty, avg, realized: realized - brokerage, brokerage };
+}
+
+async function marginSnapshot(userId, settings) {
+  const [user, trades, openOrders] = await Promise.all([
+    db(supabase.from("app_users").select("*").eq("id", userId).single()),
+    db(supabase.from("trades").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(500)),
+    db(supabase.from("orders").select("*").eq("user_id", userId).eq("status", "OPEN").limit(500))
+  ]);
+  const pos = calculatePosition(trades);
+  const openLots = openOrders.reduce((sum, order) => sum + Number(order.qty || 0), 0);
+  const usedMargin = (Math.abs(pos.qty) + openLots) * settings.marginPerLot;
+  const available = Number(user.funds || 0) + pos.realized - usedMargin;
+  return { user, pos, openLots, usedMargin, available };
+}
+
 async function fillOrder(order) {
+  const settings = await ensureSettings();
   const fillPrice = executablePrice(order);
   if (!fillPrice) return order;
+  const brokerage = Number(settings.brokeragePerLot || 0) * Number(order.qty || 0);
   const now = new Date().toISOString();
   await db(supabase.from("orders").update({
     status: "FILLED",
@@ -153,7 +218,8 @@ async function fillOrder(order) {
     user_id: order.user_id,
     side: order.side,
     qty: order.qty,
-    price: fillPrice
+    price: fillPrice,
+    brokerage
   }));
   return { ...order, status: "FILLED", fill_price: fillPrice, filled_at: now };
 }
@@ -199,6 +265,7 @@ async function updateMarket() {
       ltp: roundTick(market.ltp + (Math.random() - 0.48) * 1.4),
       source: "demo"
     };
+    await matchOpenOrders();
     return;
   }
 
@@ -225,6 +292,7 @@ setInterval(() => {
   });
 }, POLL_MS);
 updateMarket().catch(() => {});
+ensureSettings().catch(() => {});
 
 app.post("/api/login", async (req, res) => {
   try {
@@ -252,6 +320,7 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/state", requireAuth, async (req, res) => {
   try {
+    const settings = await ensureSettings();
     if (req.session.role === "master") {
       const [users, orders, trades] = await Promise.all([
         db(supabase.from("app_users").select("*").order("created_at", { ascending: false })),
@@ -263,7 +332,8 @@ app.get("/api/state", requireAuth, async (req, res) => {
         master: { id: "MASTER", name: "Master" },
         users: users.map(publicUser),
         orders: orders.map(publicOrder),
-        trades: trades.map(publicTrade)
+        trades: trades.map(publicTrade),
+        settings
       });
     }
 
@@ -277,7 +347,8 @@ app.get("/api/state", requireAuth, async (req, res) => {
       master: { id: "MASTER", name: "Master" },
       users: [publicUser(user)],
       orders: orders.map(publicOrder),
-      trades: trades.map(publicTrade)
+      trades: trades.map(publicTrade),
+      settings
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -286,6 +357,25 @@ app.get("/api/state", requireAuth, async (req, res) => {
 
 app.get("/api/market", requireAuth, (req, res) => {
   res.json({ ...market, error: lastMarketError });
+});
+
+app.patch("/api/settings", requireAuth, requireMaster, async (req, res) => {
+  try {
+    const brokeragePerLot = Number(req.body.brokeragePerLot ?? cachedSettings.brokeragePerLot);
+    const marginPerLot = Number(req.body.marginPerLot ?? cachedSettings.marginPerLot);
+    if (!Number.isFinite(brokeragePerLot) || brokeragePerLot < 0) return res.status(400).json({ error: "Brokerage per lot must be zero or more." });
+    if (!Number.isFinite(marginPerLot) || marginPerLot < 0) return res.status(400).json({ error: "Margin per lot must be zero or more." });
+    const row = await db(supabase.from("app_settings").upsert({
+      id: 1,
+      brokerage_per_lot: brokeragePerLot,
+      margin_per_lot: marginPerLot,
+      updated_at: new Date().toISOString()
+    }).select().single());
+    cachedSettings = publicSettings(row);
+    res.json({ settings: cachedSettings });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.post("/api/users", requireAuth, requireMaster, async (req, res) => {
@@ -363,8 +453,16 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     if (!qty || qty < 1) return res.status(400).json({ error: "Enter at least 1 lot." });
     if (type === "LIMIT" && !price) return res.status(400).json({ error: "Enter a valid limit price." });
 
-    const user = await db(supabase.from("app_users").select("*").eq("id", req.session.id).single());
-    if (!user.active) return res.status(403).json({ error: "User is blocked." });
+    const settings = await ensureSettings();
+    const margin = await marginSnapshot(req.session.id, settings);
+    if (!margin.user.active) return res.status(403).json({ error: "User is blocked." });
+    const requiredMargin = settings.marginPerLot * qty;
+    const estimatedBrokerage = settings.brokeragePerLot * qty;
+    if (margin.available < requiredMargin + estimatedBrokerage) {
+      return res.status(400).json({
+        error: `Insufficient funds. Required margin plus brokerage is ${requiredMargin + estimatedBrokerage}, available is ${Math.max(0, margin.available).toFixed(2)}.`
+      });
+    }
 
     const order = await db(supabase.from("orders").insert({
       user_id: req.session.id,

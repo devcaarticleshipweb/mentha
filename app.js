@@ -14,7 +14,8 @@ const seedState = {
     { id: "TRADER1", pin: "1111", name: "Trader 1", funds: 500000, active: true, createdAt: new Date().toISOString() }
   ],
   orders: [],
-  trades: []
+  trades: [],
+  settings: { brokeragePerLot: 0, marginPerLot: 0 }
 };
 
 let state = structuredClone(seedState);
@@ -82,6 +83,7 @@ function localExecutablePrice(order) {
 function localFillOrder(db, order) {
   const fillPrice = localExecutablePrice(order);
   if (!fillPrice) return;
+  const brokerage = Number(db.settings?.brokeragePerLot || 0) * Number(order.qty || 0);
   order.status = "FILLED";
   order.fillPrice = fillPrice;
   order.filledAt = new Date().toISOString();
@@ -92,8 +94,20 @@ function localFillOrder(db, order) {
     side: order.side,
     qty: order.qty,
     price: fillPrice,
+    brokerage,
     time: new Date().toISOString()
   });
+}
+
+function localMatchOpenOrders() {
+  const db = localStore();
+  let changed = false;
+  for (const order of db.orders.filter((item) => item.status === "OPEN")) {
+    const before = order.status;
+    localFillOrder(db, order);
+    if (order.status !== before) changed = true;
+  }
+  if (changed) saveLocalStore(db);
 }
 
 async function localApi(path, options = {}) {
@@ -131,6 +145,16 @@ async function localApi(path, options = {}) {
   }
 
   if (path === "/api/market") return { ...market, source: "demo" };
+
+  if (path === "/api/settings" && method === "PATCH") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    db.settings = {
+      brokeragePerLot: Math.max(0, Number(body.brokeragePerLot || 0)),
+      marginPerLot: Math.max(0, Number(body.marginPerLot || 0))
+    };
+    saveLocalStore(db);
+    return { settings: db.settings };
+  }
 
   if (path === "/api/users" && method === "POST") {
     if (session.role !== "master") throw new Error("Master access required.");
@@ -181,6 +205,11 @@ async function localApi(path, options = {}) {
 
   if (path === "/api/orders" && method === "POST") {
     if (session.role !== "user") throw new Error("Login as a trader to place orders.");
+    const user = db.users.find((u) => u.id === session.id);
+    const pos = positionFor(session.id);
+    const openLots = db.orders.filter((o) => o.userId === session.id && o.status === "OPEN").reduce((sum, order) => sum + Number(order.qty || 0), 0);
+    const settings = db.settings || seedState.settings;
+    const available = Number(user?.funds || 0) + pos.realized - (Math.abs(pos.qty) + openLots) * Number(settings.marginPerLot || 0);
     const order = {
       id: localId("ORD"),
       userId: session.id,
@@ -191,6 +220,8 @@ async function localApi(path, options = {}) {
       status: "OPEN",
       createdAt: new Date().toISOString()
     };
+    const required = Number(settings.marginPerLot || 0) * order.qty + Number(settings.brokeragePerLot || 0) * order.qty;
+    if (available < required) throw new Error(`Insufficient funds. Required margin plus brokerage is ${required}, available is ${Math.max(0, available).toFixed(2)}.`);
     localFillOrder(db, order);
     db.orders.push(order);
     saveLocalStore(db);
@@ -292,9 +323,11 @@ function positionFor(userId) {
   let qty = 0;
   let avg = 0;
   let realized = 0;
+  let brokerage = 0;
 
   for (const t of lots.slice().reverse()) {
     const signedQty = t.side === "BUY" ? t.qty : -t.qty;
+    brokerage += Number(t.brokerage || 0);
     if (qty === 0 || Math.sign(qty) === Math.sign(signedQty)) {
       avg = (Math.abs(qty) * avg + Math.abs(signedQty) * t.price) / (Math.abs(qty) + Math.abs(signedQty));
       qty += signedQty;
@@ -311,14 +344,27 @@ function positionFor(userId) {
   }
 
   const mtm = qty === 0 ? 0 : (qty > 0 ? market.ltp - avg : avg - market.ltp) * Math.abs(qty) * tradeMultiplier();
-  return { qty, avg, realized, mtm, net: realized + mtm };
+  realized -= brokerage;
+  return { qty, avg, realized, mtm, net: realized + mtm, brokerage };
 }
 
 function availableFunds(userId) {
   const user = state.users.find((u) => u.id === userId);
   if (!user) return 0;
   const pos = positionFor(userId);
-  return Number(user.funds || 0) + pos.realized;
+  return Number(user.funds || 0) + pos.realized - usedMargin(userId);
+}
+
+function openOrderLots(userId) {
+  return state.orders
+    .filter((order) => order.userId === userId && order.status === "OPEN")
+    .reduce((sum, order) => sum + Number(order.qty || 0), 0);
+}
+
+function usedMargin(userId) {
+  const pos = positionFor(userId);
+  const lots = Math.abs(pos.qty) + openOrderLots(userId);
+  return lots * Number(state.settings?.marginPerLot || 0);
 }
 
 function normalizeMarket(data) {
@@ -379,6 +425,7 @@ function startLocalMarket() {
       asks: Array.from({ length: 5 }, (_, i) => [roundTick(next + spread / 2 + i * 0.1), 72 * (2 + Math.floor(Math.random() * 7))]),
       source: "demo"
     };
+    localMatchOpenOrders();
     if (state.session) renderIfNotEditing();
   }, 1800);
 }
@@ -539,9 +586,11 @@ function tradeTemplate(pos) {
     return `<section class="panel"><h2>Trade</h2><p class="muted">Master can supervise users, adjust funds, and void orders from Admin. Login as a trader to place practice trades.</p></section>`;
   }
   const lastQty = Math.max(1, Math.abs(pos?.qty || 1));
+  const brokerage = Number(state.settings?.brokeragePerLot || 0);
+  const margin = Number(state.settings?.marginPerLot || 0);
   return `
     <section class="panel">
-      <div class="row"><h2>Order Ticket</h2><span class="chip">Paper simulator</span></div>
+      <div class="row"><h2>Order Ticket</h2><span class="chip">Margin ${whole(margin)} / lot</span></div>
       <form class="trade-form" id="orderForm">
         <div class="side-tabs">
           <button type="button" class="seg ${activeSide === "BUY" ? "active" : ""}" data-side="BUY">Buy</button>
@@ -552,6 +601,7 @@ function tradeTemplate(pos) {
           <label class="field"><span class="label">Lots</span><input id="orderQty" type="number" min="1" step="1" value="${lastQty}"></label>
         </div>
         <label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="0.1" value="${fmt(activeSide === "BUY" ? market.asks[0][0] : market.bids[0][0], 1)}"></label>
+        <p class="muted">Market buy fills at best ask, market sell fills at best bid. Limit orders fill when LTP reaches the limit. Brokerage ${whole(brokerage)} per lot.</p>
         <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(SCRIP.symbol)}</button>
       </form>
     </section>
@@ -599,6 +649,11 @@ function fundsTemplate() {
         <div class="stat"><span class="label">Realized</span><span class="value ${pos.realized >= 0 ? "up" : "down"}">₹${signed(pos.realized)}</span></div>
         <div class="stat"><span class="label">Available</span><span class="value">₹${whole(availableFunds(user.id))}</span></div>
       </div>
+      <div class="stats" style="margin-top:8px">
+        <div class="stat"><span class="label">Used Margin</span><span class="value">₹${whole(usedMargin(user.id))}</span></div>
+        <div class="stat"><span class="label">Brokerage Paid</span><span class="value">₹${whole(pos.brokerage)}</span></div>
+        <div class="stat"><span class="label">Open Lots</span><span class="value">${openOrderLots(user.id)}</span></div>
+      </div>
     </section>
   `;
 }
@@ -617,6 +672,16 @@ function userFundItem(u) {
 
 function adminTemplate() {
   return `
+    <section class="panel">
+      <h2>Trading Rules</h2>
+      <form class="trade-form" id="settingsForm">
+        <div class="form-grid">
+          <label class="field"><span class="label">Brokerage per lot</span><input id="brokeragePerLot" type="number" min="0" step="1" value="${Number(state.settings?.brokeragePerLot || 0)}"></label>
+          <label class="field"><span class="label">Margin per lot</span><input id="marginPerLot" type="number" min="0" step="1" value="${Number(state.settings?.marginPerLot || 0)}"></label>
+        </div>
+        <button class="secondary">Save trading rules</button>
+      </form>
+    </section>
     <section class="panel">
       <h2>Create User</h2>
       <form class="trade-form" id="userForm">
@@ -726,6 +791,7 @@ function bindShell() {
   document.querySelectorAll("[data-toggle]").forEach((btn) => btn.addEventListener("click", () => toggleUser(btn.dataset.toggle)));
   document.querySelectorAll("[data-remove]").forEach((btn) => btn.addEventListener("click", () => removeUser(btn.dataset.remove)));
   document.querySelectorAll("[data-funds]").forEach((btn) => btn.addEventListener("click", () => applyFunds(btn.dataset.funds)));
+  document.getElementById("settingsForm")?.addEventListener("submit", saveSettings);
 }
 
 function logout() {
@@ -820,6 +886,22 @@ async function applyFunds(id) {
     });
     await refreshState();
     notify(`Funds updated for ${id}.`);
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const brokeragePerLot = Number(document.getElementById("brokeragePerLot").value);
+  const marginPerLot = Number(document.getElementById("marginPerLot").value);
+  try {
+    await api("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({ brokeragePerLot, marginPerLot })
+    });
+    await refreshState();
+    notify("Trading rules saved.");
   } catch (error) {
     notify(error.message);
   }

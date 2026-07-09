@@ -14,6 +14,8 @@ This version is ready for Render + Supabase.
 
 Keep the service role key secret. It goes only in Render environment variables.
 
+If you already deployed an older version, run `supabase-schema.sql` again. It safely adds the new brokerage, margin, and settings fields.
+
 ## 2. Push Project To GitHub
 
 Upload this folder to a GitHub repo.
@@ -62,6 +64,22 @@ your MASTER_PIN
 ```
 
 Create users from the Admin tab. Users can then login from their own phone.
+
+## 5. Configure Trading Rules
+
+Login as master and open Admin.
+
+Set:
+
+- Brokerage per lot: fixed rupee amount charged on every filled lot.
+- Margin per lot: rupee margin required for each lot before an order is accepted.
+
+Order behavior:
+
+- Market buy fills immediately at the first sell/ask in market depth.
+- Market sell fills immediately at the first buy/bid in market depth.
+- Buy limit fills when LTP is at or below the limit price.
+- Sell limit fills when LTP is at or above the limit price.
 
 ## Notes
 
