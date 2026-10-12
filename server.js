@@ -38,6 +38,14 @@ const demoMarket = {
   low: 918.9,
   volume: 18420,
   ltq: 72,
+  avgPrice: 925.9,
+  lowerCircuit: 884.9,
+  upperCircuit: 958.7,
+  netChange: 5.6,
+  changePercent: 0.61,
+  oi: 458,
+  previousOi: 453,
+  oiChange: 5,
   source: "demo",
   bids: [[927.3, 144], [927.2, 216], [927.1, 360], [927.0, 504], [926.9, 288]],
   asks: [[927.5, 180], [927.6, 288], [927.7, 432], [927.8, 360], [927.9, 540]]
@@ -248,28 +256,52 @@ function normalizeDepth(levels) {
     .slice(0, 5);
 }
 
+function firstNumber(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === "") continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
 function parseUpstoxQuote(raw) {
   const first = Object.values(raw?.data || {})[0];
   if (!first) throw new Error("No quote returned by Upstox.");
   const bids = normalizeDepth(first.depth?.buy);
   const asks = normalizeDepth(first.depth?.sell);
-  const oi = Number(first.oi ?? first.open_interest ?? 0);
-  const previousOi = Number(first.previous_oi ?? first.prev_oi ?? 0);
+  const feed = first.eFeedDetails || first.extended_feed_details || {};
+  const ltpc = first.ltpc || {};
+  const ltp = firstNumber(first.last_price, first.ltp, ltpc.ltp, demoMarket.ltp);
+  const prevClose = firstNumber(first.cp, first.close_price, first.previous_close, first.ohlc?.close, ltpc.cp, demoMarket.prevClose);
+  const netChange = firstNumber(first.net_change, first.change, first.absolute_change, ltp - prevClose);
+  const changePercent = firstNumber(first.change_percent, first.percent_change, first.pchange, prevClose ? (netChange / prevClose) * 100 : 0);
+  const oi = firstNumber(first.oi, first.open_interest, feed.oi, 0);
+  const previousOi = firstNumber(first.previous_oi, first.prev_oi, feed.poi, feed.previous_oi, 0);
+  const oiChange = firstNumber(first.oi_change, first.oi_chg, first.oi_change_value, feed.oi_chg, feed.oichange, previousOi ? oi - previousOi : 0);
+  const open = firstNumber(first.ohlc?.open, first.open, demoMarket.open);
+  const high = firstNumber(first.ohlc?.high, first.high, demoMarket.high);
+  const low = firstNumber(first.ohlc?.low, first.low, demoMarket.low);
   return {
-    ltp: Number(first.last_price || demoMarket.ltp),
-    prevClose: Number(first.ohlc?.close || demoMarket.prevClose),
-    open: Number(first.ohlc?.open || demoMarket.open),
-    high: Number(first.ohlc?.high || demoMarket.high),
-    low: Number(first.ohlc?.low || demoMarket.low),
-    volume: Number(first.volume ?? first.vtt ?? 0),
-    ltq: Number(first.last_quantity ?? first.ltq ?? 0),
-    totalBuyQty: Number(first.total_buy_quantity ?? first.tbq ?? 0),
-    totalSellQty: Number(first.total_sell_quantity ?? first.tsq ?? 0),
+    ltp,
+    prevClose,
+    netChange,
+    changePercent,
+    open,
+    high,
+    low,
+    lowerCircuit: firstNumber(first.lower_circuit_limit, first.lower_circuit, first.lc, feed.lc, feed.lower_circuit_limit, demoMarket.lowerCircuit),
+    upperCircuit: firstNumber(first.upper_circuit_limit, first.upper_circuit, first.uc, feed.uc, feed.upper_circuit_limit, demoMarket.upperCircuit),
+    volume: firstNumber(first.volume, first.vtt, feed.vtt, 0),
+    avgPrice: firstNumber(first.average_price, first.avg_price, first.average_traded_price, first.atp, feed.atp, (open + high + low + ltp) / 4),
+    ltq: firstNumber(first.ltq, first.last_quantity, first.last_traded_quantity, ltpc.ltq, 0),
+    totalBuyQty: firstNumber(first.total_buy_quantity, first.tbq, 0),
+    totalSellQty: firstNumber(first.total_sell_quantity, first.tsq, 0),
     oi,
     previousOi,
-    oiChange: previousOi ? oi - previousOi : Number(first.oi_change ?? first.oi_change_value ?? 0),
-    oiDayHigh: Number(first.oi_day_high ?? 0),
-    oiDayLow: Number(first.oi_day_low ?? 0),
+    oiChange,
+    oiDayHigh: firstNumber(first.oi_day_high, feed.oi_day_high, 0),
+    oiDayLow: firstNumber(first.oi_day_low, feed.oi_day_low, 0),
     bids: bids.length ? bids : demoMarket.bids,
     asks: asks.length ? asks : demoMarket.asks,
     source: "upstox",

@@ -276,6 +276,22 @@ function signed(n) {
   return `${n >= 0 ? "+" : ""}${fmt(n)}`;
 }
 
+function finiteNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function positiveNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function marketMove() {
+  const change = finiteNumber(market.netChange, market.ltp - market.prevClose);
+  const pct = finiteNumber(market.changePercent, market.prevClose ? (change / market.prevClose) * 100 : 0);
+  return { change, pct };
+}
+
 function formatTradeTime(value) {
   const numeric = Number(value || 0);
   const date = numeric ? new Date(numeric) : new Date();
@@ -302,6 +318,11 @@ function makeInitialMarket() {
     low: 918.9,
     volume: 18420,
     ltq: 72,
+    avgPrice: 925.9,
+    lowerCircuit: 884.9,
+    upperCircuit: 958.7,
+    netChange: 5.6,
+    changePercent: 0.61,
     totalBuyQty: 1512,
     totalSellQty: 1800,
     oi: 458,
@@ -431,19 +452,24 @@ function usedMargin(userId) {
 
 function normalizeMarket(data) {
   const next = { ...market, ...data, lastTick: Date.now() };
-  next.ltp = Number(next.ltp || market.ltp);
-  next.prevClose = Number(next.prevClose || next.close || market.prevClose);
-  next.open = Number(next.open || market.open);
-  next.high = Number(next.high || Math.max(market.high, next.ltp));
-  next.low = Number(next.low || Math.min(market.low, next.ltp));
-  next.volume = Number(next.volume || market.volume);
-  next.ltq = Number(next.ltq || 0);
-  next.totalBuyQty = Number(next.totalBuyQty ?? next.total_buy_quantity ?? market.totalBuyQty ?? 0);
-  next.totalSellQty = Number(next.totalSellQty ?? next.total_sell_quantity ?? market.totalSellQty ?? 0);
-  next.oi = Number(next.oi ?? next.open_interest ?? market.oi ?? 0);
-  next.previousOi = Number(next.previousOi ?? next.previous_oi ?? market.previousOi ?? 0);
-  next.oiChange = Number(next.oiChange ?? next.oi_change ?? (next.previousOi ? next.oi - next.previousOi : market.oiChange ?? 0));
-  next.lastTradeTime = Number(next.lastTradeTime ?? next.last_trade_time ?? market.lastTradeTime ?? 0);
+  next.ltp = finiteNumber(next.ltp ?? next.last_price, market.ltp);
+  next.prevClose = finiteNumber(next.prevClose ?? next.cp ?? next.close ?? next.close_price, market.prevClose);
+  next.open = finiteNumber(next.open, market.open);
+  next.high = finiteNumber(next.high, Math.max(market.high, next.ltp));
+  next.low = finiteNumber(next.low, Math.min(market.low, next.ltp));
+  next.lowerCircuit = positiveNumber(next.lowerCircuit ?? next.lower_circuit_limit ?? next.lower_circuit, market.lowerCircuit);
+  next.upperCircuit = positiveNumber(next.upperCircuit ?? next.upper_circuit_limit ?? next.upper_circuit, market.upperCircuit);
+  next.netChange = finiteNumber(next.netChange ?? next.net_change ?? next.change, next.ltp - next.prevClose);
+  next.changePercent = finiteNumber(next.changePercent ?? next.change_percent ?? next.percent_change, next.prevClose ? (next.netChange / next.prevClose) * 100 : 0);
+  next.volume = finiteNumber(next.volume, market.volume);
+  next.avgPrice = positiveNumber(next.avgPrice ?? next.average_price ?? next.avg_price ?? next.atp, market.avgPrice);
+  next.ltq = finiteNumber(next.ltq ?? next.last_quantity ?? next.last_traded_quantity, 0);
+  next.totalBuyQty = finiteNumber(next.totalBuyQty ?? next.total_buy_quantity, market.totalBuyQty ?? 0);
+  next.totalSellQty = finiteNumber(next.totalSellQty ?? next.total_sell_quantity, market.totalSellQty ?? 0);
+  next.oi = finiteNumber(next.oi ?? next.open_interest, market.oi ?? 0);
+  next.previousOi = finiteNumber(next.previousOi ?? next.previous_oi, market.previousOi ?? 0);
+  next.oiChange = finiteNumber(next.oiChange ?? next.oi_change ?? next.oi_chg, next.previousOi ? next.oi - next.previousOi : market.oiChange ?? 0);
+  next.lastTradeTime = finiteNumber(next.lastTradeTime ?? next.last_trade_time, market.lastTradeTime ?? 0);
   next.bids = Array.isArray(data.bids) && data.bids.length ? data.bids : market.bids;
   next.asks = Array.isArray(data.asks) && data.asks.length ? data.asks : market.asks;
   return next;
@@ -484,13 +510,18 @@ function startLocalMarket() {
     const spread = 0.2 + (Math.random() > 0.7 ? 0.1 : 0);
     const bids = Array.from({ length: 5 }, (_, i) => [roundTick(next - spread / 2 - i * 0.1), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
     const asks = Array.from({ length: 5 }, (_, i) => [roundTick(next + spread / 2 + i * 0.1), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
+    const ltq = [36, 72, 108, 144, 216, 360][Math.floor(Math.random() * 6)];
+    const netChange = next - market.prevClose;
     market = {
       ...market,
       ltp: next,
+      netChange,
+      changePercent: market.prevClose ? (netChange / market.prevClose) * 100 : 0,
       high: Math.max(market.high, next),
       low: Math.min(market.low, next),
-      ltq: [36, 72, 108, 144, 216, 360][Math.floor(Math.random() * 6)],
-      volume: market.volume + market.ltq,
+      avgPrice: (market.avgPrice + next) / 2,
+      ltq,
+      volume: market.volume + ltq,
       totalBuyQty: bids.reduce((sum, [, qty]) => sum + qty, 0),
       totalSellQty: asks.reduce((sum, [, qty]) => sum + qty, 0),
       oi: market.oi || 458,
@@ -575,8 +606,7 @@ function shellTemplate() {
   const user = currentUser();
   const pos = isMaster() ? null : positionFor(user.id);
   const content = viewTemplate(user, pos);
-  const change = market.ltp - market.prevClose;
-  const pct = (change / market.prevClose) * 100;
+  const { change, pct } = marketMove();
   const isPortfolio = activeView === "positions";
   return `
     <main class="shell">
@@ -647,14 +677,14 @@ function navButton(view, icon, label) {
 }
 
 function marketTemplate(pulse = false) {
-  const change = market.ltp - market.prevClose;
-  const pct = (change / market.prevClose) * 100;
-  const lower = market.prevClose * 0.96;
-  const upper = market.prevClose * 1.04;
-  const circuitPos = Math.max(4, Math.min(96, ((market.ltp - lower) / (upper - lower)) * 100));
+  const { change, pct } = marketMove();
+  const lower = finiteNumber(market.lowerCircuit, market.prevClose * 0.96);
+  const upper = finiteNumber(market.upperCircuit, market.prevClose * 1.04);
+  const circuitRange = upper - lower;
+  const circuitPos = circuitRange > 0 ? Math.max(4, Math.min(96, ((market.ltp - lower) / circuitRange) * 100)) : 50;
   const detailRows = [
     ["Volume", whole(market.volume)],
-    ["Avg. traded price", fmt((market.open + market.high + market.low + market.ltp) / 4, 2)],
+    ["Avg. traded price", fmt(market.avgPrice, 2)],
     ["Last traded time", formatTradeTime(market.lastTradeTime || market.timestamp || market.lastTick)],
     ["Last traded quantity", whole(market.ltq)],
     ["Spot", fmt(market.ltp, 2)],
@@ -705,13 +735,15 @@ function depthTemplate() {
       <div class="depth-table">
         <div class="depth-head"><span>Qty</span><span>Orders</span><span>Bid</span><span>Ask</span><span>Orders</span><span>Qty</span></div>
         ${rows.map(({ bid, ask }) => `
-          <div class="depth-row">
-            <span class="qty-cell buy-depth" style="--w:${Math.max(10, (bid[1] / maxQty) * 100)}%">${whole(bid[1])}</span>
+          <div class="depth-row" style="--buy-w:${Math.max(10, (bid[1] / maxQty) * 100)}%; --sell-w:${Math.max(10, (ask[1] / maxQty) * 100)}%;">
+            <span class="depth-side-bar buy-depth"></span>
+            <span class="depth-side-bar sell-depth"></span>
+            <span class="qty-cell">${whole(bid[1])}</span>
             <span class="order-count">${whole(bid[2] || 0)}</span>
             <strong>${fmt(bid[0], 2)}</strong>
             <strong>${fmt(ask[0], 2)}</strong>
             <span class="order-count">${whole(ask[2] || 0)}</span>
-            <span class="qty-cell sell-depth" style="--w:${Math.max(10, (ask[1] / maxQty) * 100)}%">${whole(ask[1])}</span>
+            <span class="qty-cell">${whole(ask[1])}</span>
           </div>
         `).join("")}
       </div>
