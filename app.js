@@ -23,6 +23,7 @@ let state = structuredClone(seedState);
 let market = makeInitialMarket();
 let activeView = "trade";
 let activeSide = "BUY";
+let marketDetailsExpanded = false;
 let toastTimer = null;
 let refreshTimer = null;
 let localMarketTimer = null;
@@ -549,24 +550,42 @@ function shellTemplate() {
   const user = currentUser();
   const pos = isMaster() ? null : positionFor(user.id);
   const content = viewTemplate(user, pos);
+  const change = market.ltp - market.prevClose;
+  const pct = (change / market.prevClose) * 100;
+  const isPortfolio = activeView === "positions";
   return `
     <main class="shell">
-      <header class="topbar">
-        <div class="brand">
-          <div class="mark">M</div>
-          <div>
-            <h1>${esc(SCRIP.symbol)}</h1>
-            <p>${esc(SCRIP.expiry)} · Lot ${SCRIP.lotSize}</p>
+      ${isPortfolio ? portfolioHeaderTemplate() : `
+        <header class="upstox-header">
+          <button class="back-btn" aria-label="Back">‹</button>
+          <div class="brand">
+            <div class="instrument-icon">
+              <span></span><span></span><span></span>
+            </div>
+            <div>
+              <h1>MENTHAOIL FUT</h1>
+              <p>MCX 30 OCT 26</p>
+            </div>
           </div>
+          <div class="header-price">
+            <strong class="${change >= 0 ? "up" : "down"}">${fmt(market.ltp, 2)}</strong>
+            <span class="${change >= 0 ? "up" : "down"}">${signed(change)} (${signed(pct)}%)</span>
+          </div>
+        </header>
+
+        <div class="market-tabs">
+          <button class="active">Market</button>
+          <button>Charts</button>
+          <button>News</button>
         </div>
-        <button class="role-pill" id="logoutBtn">${isMaster() ? "Master" : esc(user.id)}</button>
-      </header>
+      `}
 
       <nav class="bottom-nav">
-        ${navButton("trade", "⇄", "Trade")}
-        ${navButton("positions", "◫", "Positions")}
-        ${navButton("orders", "≡", "Orders")}
-        ${navButton(isMaster() ? "admin" : "account", isMaster() ? "⚙" : "₹", isMaster() ? "Admin" : "Account")}
+        ${navButton("trade", "▣", "My lists")}
+        ${navButton("orders", "🛒", "Orders")}
+        ${navButton("positions", "▣", "Portfolio")}
+        ${navButton("discover", "◎", "Discover")}
+        ${navButton(isMaster() ? "admin" : "account", "◉", isMaster() ? "Admin" : "Account")}
       </nav>
 
       <section class="grid ${activeView === "trade" ? "trade-stack" : ""}">
@@ -576,12 +595,25 @@ function shellTemplate() {
   `;
 }
 
+function portfolioHeaderTemplate() {
+  return `
+    <header class="portfolio-header">
+      <div class="portfolio-status">11:31 AM <span>▴ ≋ 🔋</span></div>
+      <div class="portfolio-title-row">
+        <h1>Portfolio</h1>
+        <div class="portfolio-icons"><span>▰</span><span>♢</span><span>⇱</span><span>≡</span><span>⌕</span></div>
+      </div>
+    </header>
+  `;
+}
+
 function viewTemplate(user, pos) {
-  if (activeView === "trade") return `${marketTemplate(true)}${depthTemplate()}${tradeTemplate(pos)}`;
+  if (activeView === "home" || activeView === "trade") return `${marketTemplate(true)}${depthTemplate()}${tradeTemplate(pos)}${tradeActionBar(pos)}`;
   if (activeView === "positions") return positionsPageTemplate();
   if (activeView === "orders") return ordersTemplate();
   if (activeView === "admin") return adminTemplate();
   if (activeView === "account" || activeView === "funds") return accountLedgerTemplate(user, pos);
+  if (activeView === "discover") return `<section class="panel"><h2>Discover</h2><p class="muted">Discovery tools can be added here later.</p></section>`;
   return tradeTemplate(pos);
 }
 
@@ -592,38 +624,91 @@ function navButton(view, icon, label) {
 function marketTemplate(pulse = false) {
   const change = market.ltp - market.prevClose;
   const pct = (change / market.prevClose) * 100;
+  const lower = market.prevClose * 0.96;
+  const upper = market.prevClose * 1.04;
+  const circuitPos = Math.max(4, Math.min(96, ((market.ltp - lower) / (upper - lower)) * 100));
+  const detailRows = [
+    ["Volume", whole(market.volume)],
+    ["Avg. traded price", fmt((market.open + market.high + market.low + market.ltp) / 4, 2)],
+    ["Last traded time", new Date(market.lastTick || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })],
+    ["Last traded quantity", whole(market.ltq)],
+    ["Spot", fmt(market.ltp, 2)],
+    ["Last trading date", "30 Oct 26"],
+    ["Expiry", "30 Oct 26"],
+    ["OI (chg)", "+5"],
+    ["Open Interest", "458"]
+  ];
   return `
-    <section class="market-header ${pulse ? "pulse-board" : ""}">
-      <div class="quote-row">
-        <div>
-          <div class="price ${change >= 0 ? "up" : "down"}">${fmt(market.ltp, 1)}</div>
-          <p class="${change >= 0 ? "up" : "down"}">${signed(change)} (${signed(pct)}%)</p>
-        </div>
-        <span class="feed-pill">${market.source === "upstox" ? "Upstox live" : "Demo feed"}</span>
+    <section class="market-card ${pulse ? "pulse-board" : ""}">
+      <div class="section-title-row">
+        <h2>Today's Market</h2>
       </div>
-      <div class="stats">
-        <div class="stat"><span class="label">Volume</span><span class="value">${whole(market.volume)}</span></div>
-        <div class="stat"><span class="label">LTQ</span><span class="value">${whole(market.ltq)}</span></div>
-        <div class="stat"><span class="label">Range</span><span class="value">${fmt(market.low, 1)}-${fmt(market.high, 1)}</span></div>
+      <div class="today-grid">
+        <div><span>Open</span><strong>${fmt(market.open, 2)}</strong></div>
+        <div><span>High</span><strong>${fmt(market.high, 2)}</strong></div>
+        <div><span>Low</span><strong>${fmt(market.low, 2)}</strong></div>
+        <div class="prev-close-cell">
+          <span>Prev. close</span>
+          <strong>${fmt(market.prevClose, 2)}</strong>
+          <button class="market-toggle" type="button" data-market-toggle aria-label="${marketDetailsExpanded ? "Hide market details" : "Show market details"}">${marketDetailsExpanded ? "⌃" : "⌄"}</button>
+        </div>
+      </div>
+      <div class="circuit-block">
+        <span>Circuit (Lower-Upper)</span>
+        <div class="circuit-line"><i style="left:${circuitPos}%"></i></div>
+        <div class="row"><strong>${fmt(lower, 2)}</strong><strong>${fmt(upper, 2)}</strong></div>
+      </div>
+      <div class="market-detail-list ${marketDetailsExpanded ? "expanded" : ""}">
+        ${detailRows.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}
       </div>
     </section>
   `;
 }
 
 function depthTemplate() {
-  const maxQty = Math.max(...market.bids.map((x) => x[1]), ...market.asks.map((x) => x[1]), 1);
-  const side = (rows, type) => rows.map(([price, qty]) => `
-    <div class="depth-line">
-      <div class="depth-bar ${type}-bg" style="width:${Math.max(8, (qty / maxQty) * 100)}%"></div>
-      <span class="${type === "buy" ? "up" : "down"}">${fmt(price, 1)}</span><span>${whole(qty)}</span>
-    </div>
-  `).join("");
+  const rows = Array.from({ length: 5 }, (_, index) => ({
+    bid: market.bids[index] || [0, 0],
+    ask: market.asks[index] || [0, 0]
+  }));
+  const maxQty = Math.max(...rows.map((row) => row.bid[1]), ...rows.map((row) => row.ask[1]), 1);
+  const totalBuy = market.bids.reduce((sum, [, qty]) => sum + qty, 0);
+  const totalSell = market.asks.reduce((sum, [, qty]) => sum + qty, 0);
+  const buyPct = totalBuy + totalSell ? Math.round((totalBuy / (totalBuy + totalSell)) * 100) : 50;
   return `
-    <section class="panel">
-      <div class="row"><h2>Market Depth</h2><span class="muted">Price / Qty</span></div>
-      <div class="depth">
-        <div class="depth-side">${side(market.bids, "buy")}</div>
-        <div class="depth-side">${side(market.asks, "sell")}</div>
+    <section class="depth-card">
+      <h2>Market Depth</h2>
+      <div class="depth-table">
+        <div class="depth-head"><span>Qty</span><span>Bid</span><span>Ask</span><span>Qty</span></div>
+        ${rows.map(({ bid, ask }) => `
+          <div class="depth-row">
+            <span class="qty-cell buy-depth" style="--w:${Math.max(10, (bid[1] / maxQty) * 100)}%">${whole(bid[1])}</span>
+            <strong>${fmt(bid[0], 2)}</strong>
+            <strong>${fmt(ask[0], 2)}</strong>
+            <span class="qty-cell sell-depth" style="--w:${Math.max(10, (ask[1] / maxQty) * 100)}%">${whole(ask[1])}</span>
+          </div>
+        `).join("")}
+      </div>
+      <div class="depth-total">
+        <div><span>Total buy qty.</span><strong>${buyPct}% (${whole(totalBuy)})</strong></div>
+        <div><span>Total sell qty.</span><strong>(${whole(totalSell)}) ${100 - buyPct}%</strong></div>
+      </div>
+      <div class="depth-ratio"><span style="width:${buyPct}%"></span><i style="left:${buyPct}%"></i></div>
+    </section>
+  `;
+}
+
+function tradeActionBar(pos) {
+  if (isMaster()) return "";
+  return `
+    <section class="upstox-actions">
+      <div class="action-row">
+        <button class="buy-action" data-side="BUY">Buy</button>
+        <button class="sell-action" data-side="SELL">Sell</button>
+      </div>
+      <div class="utility-row">
+        <button>⏱ GTT</button>
+        <button>♟ Alerts</button>
+        <button class="following">✓ Following</button>
       </div>
     </section>
   `;
@@ -804,40 +889,57 @@ function positionsPageTemplate() {
   const openRows = rows.flatMap(({ user, report }) => report.open.map((item) => ({ ...item, userId: user.id })));
   const closedRows = rows.flatMap(({ user, report }) => report.closed.map((item) => ({ ...item, userId: user.id })));
   return `
-    <section class="panel">
-      <span class="label">Total P&L</span>
-      <div class="pnl-hero ${total >= 0 ? "up" : "down"}">₹${signed(total)}</div>
-      <div class="stats">
-        <div class="stat"><span class="label">Open P&L</span><span class="value ${openPnl >= 0 ? "up" : "down"}">₹${signed(openPnl)}</span></div>
-        <div class="stat"><span class="label">Closed P&L</span><span class="value ${closedPnl >= 0 ? "up" : "down"}">₹${signed(closedPnl)}</span></div>
-        <div class="stat"><span class="label">Brokerage</span><span class="value">₹${whole(rows.reduce((sum, row) => sum + row.report.summary.brokerage, 0))}</span></div>
-      </div>
+    <section class="portfolio-tabs">
+      <button class="active">Positions (${openRows.length + closedRows.length})</button>
+      <button>Holdings</button>
     </section>
-    <section class="panel">
-      <div class="row"><h2>Open Positions</h2><span class="muted">${openRows.length} rows</span></div>
-      <div class="list">${openRows.length ? openRows.map(openPositionItem).join("") : empty("No open positions")}</div>
+    <section class="portfolio-filter-row">
+      <button class="active">Regular (${openRows.length + closedRows.length})</button>
+      <button>MTF</button>
+      <button>Strategy</button>
     </section>
-    <section class="panel">
-      <div class="row"><h2>Closed Positions</h2><span class="muted">${closedRows.length} rows</span></div>
-      <div class="list">${closedRows.length ? closedRows.map(closedPositionItem).join("") : empty("No closed positions")}</div>
+    <section class="portfolio-pnl-strip">
+      <div><span>Today's P&L</span><strong class="${openPnl >= 0 ? "up" : "down"}">${signed(openPnl)}</strong></div>
+      <div><span>Overall P&L</span><strong class="${total >= 0 ? "up" : "down"}">${signed(total)}</strong></div>
+    </section>
+    <section class="portfolio-list">
+      ${openRows.length ? openRows.map(openPositionItem).join("") : empty("No open positions")}
+      <div class="closed-label">Closed (${closedRows.length})</div>
+      ${closedRows.length ? closedRows.map(closedPositionItem).join("") : empty("No closed positions")}
     </section>
   `;
 }
 
 function openPositionItem(item) {
   return `
-    <article class="item">
-      <div class="row"><strong>${esc(item.userId)} · ${esc(item.side)} ${item.qty}</strong><span class="${item.pnl >= 0 ? "up" : "down"}">₹${signed(item.pnl)}</span></div>
-      <small>Avg ${fmt(item.avg, 1)} · LTP ${fmt(item.ltp, 1)}</small>
+    <article class="portfolio-position open-position">
+      <div>
+        <h3>MENTHAOIL FUT</h3>
+        <p>MCX 30 OCT 26</p>
+        <small>Delivery&nbsp;&nbsp; Qty. <span class="${item.side === "LONG" ? "up" : "down"}">${item.side === "LONG" ? "+" : "-"}${item.qty}</span></small>
+      </div>
+      <div class="position-right">
+        <strong class="${item.pnl >= 0 ? "up" : "down"}">${signed(item.pnl)}</strong>
+        <span>${fmt(item.avg, 2)} Avg.</span>
+        <span>${fmt(item.ltp, 2)} LTP</span>
+      </div>
     </article>
   `;
 }
 
 function closedPositionItem(item) {
   return `
-    <article class="item">
-      <div class="row"><strong>${esc(item.userId)} · ${esc(item.side)} ${item.qty}</strong><span class="${item.pnl >= 0 ? "up" : "down"}">₹${signed(item.pnl)}</span></div>
-      <small>Entry ${fmt(item.entry, 1)} · Exit ${fmt(item.exit, 1)} · Brokerage ₹${whole(item.brokerage)} · ${new Date(item.time).toLocaleString()}</small>
+    <article class="portfolio-position closed-position">
+      <div>
+        <h3>MENTHAOIL FUT</h3>
+        <p>MCX 30 OCT 26</p>
+        <small>Delivery&nbsp;&nbsp; Qty. 0</small>
+      </div>
+      <div class="position-right">
+        <strong class="${item.pnl >= 0 ? "up" : "down"}">${signed(item.pnl)}</strong>
+        <span>0.00 Avg.</span>
+        <span>${fmt(item.exit, 2)} LTP</span>
+      </div>
     </article>
   `;
 }
@@ -954,6 +1056,10 @@ function bindShell() {
     activeSide = btn.dataset.side;
     render();
   }));
+  document.querySelector("[data-market-toggle]")?.addEventListener("click", () => {
+    marketDetailsExpanded = !marketDetailsExpanded;
+    render();
+  });
   document.getElementById("orderForm")?.addEventListener("submit", placeOrder);
   document.querySelectorAll("[data-cancel]").forEach((btn) => btn.addEventListener("click", () => cancelOrder(btn.dataset.cancel)));
   document.getElementById("userForm")?.addEventListener("submit", createUser);

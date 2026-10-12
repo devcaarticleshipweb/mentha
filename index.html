@@ -7,6 +7,9 @@
     <title>MENTHA Paper Trade</title>
     <link rel="manifest" href="manifest.webmanifest" />
     <link rel="stylesheet" href="styles.css" />
+    <script>
+      window.MENTHA_LOCAL_ONLY = new URLSearchParams(location.search).has("local");
+    </script>
   </head>
   <body>
     <div id="app"></div>
