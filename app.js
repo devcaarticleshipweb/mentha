@@ -276,6 +276,13 @@ function signed(n) {
   return `${n >= 0 ? "+" : ""}${fmt(n)}`;
 }
 
+function formatTradeTime(value) {
+  const numeric = Number(value || 0);
+  const date = numeric ? new Date(numeric) : new Date();
+  if (Number.isNaN(date.getTime())) return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -295,21 +302,26 @@ function makeInitialMarket() {
     low: 918.9,
     volume: 18420,
     ltq: 72,
+    totalBuyQty: 1512,
+    totalSellQty: 1800,
+    oi: 458,
+    previousOi: 453,
+    oiChange: 5,
     lastTick: Date.now(),
     source: "demo",
     bids: [
-      [927.3, 144],
-      [927.2, 216],
-      [927.1, 360],
-      [927.0, 504],
-      [926.9, 288]
+      [927.3, 144, 2],
+      [927.2, 216, 3],
+      [927.1, 360, 5],
+      [927.0, 504, 7],
+      [926.9, 288, 4]
     ],
     asks: [
-      [927.5, 180],
-      [927.6, 288],
-      [927.7, 432],
-      [927.8, 360],
-      [927.9, 540]
+      [927.5, 180, 2],
+      [927.6, 288, 4],
+      [927.7, 432, 6],
+      [927.8, 360, 5],
+      [927.9, 540, 8]
     ]
   };
 }
@@ -426,6 +438,12 @@ function normalizeMarket(data) {
   next.low = Number(next.low || Math.min(market.low, next.ltp));
   next.volume = Number(next.volume || market.volume);
   next.ltq = Number(next.ltq || 0);
+  next.totalBuyQty = Number(next.totalBuyQty ?? next.total_buy_quantity ?? market.totalBuyQty ?? 0);
+  next.totalSellQty = Number(next.totalSellQty ?? next.total_sell_quantity ?? market.totalSellQty ?? 0);
+  next.oi = Number(next.oi ?? next.open_interest ?? market.oi ?? 0);
+  next.previousOi = Number(next.previousOi ?? next.previous_oi ?? market.previousOi ?? 0);
+  next.oiChange = Number(next.oiChange ?? next.oi_change ?? (next.previousOi ? next.oi - next.previousOi : market.oiChange ?? 0));
+  next.lastTradeTime = Number(next.lastTradeTime ?? next.last_trade_time ?? market.lastTradeTime ?? 0);
   next.bids = Array.isArray(data.bids) && data.bids.length ? data.bids : market.bids;
   next.asks = Array.isArray(data.asks) && data.asks.length ? data.asks : market.asks;
   return next;
@@ -464,6 +482,8 @@ function startLocalMarket() {
   localMarketTimer = setInterval(() => {
     const next = Math.max(700, roundTick(market.ltp + (Math.random() - 0.48) * 1.6));
     const spread = 0.2 + (Math.random() > 0.7 ? 0.1 : 0);
+    const bids = Array.from({ length: 5 }, (_, i) => [roundTick(next - spread / 2 - i * 0.1), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
+    const asks = Array.from({ length: 5 }, (_, i) => [roundTick(next + spread / 2 + i * 0.1), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
     market = {
       ...market,
       ltp: next,
@@ -471,8 +491,13 @@ function startLocalMarket() {
       low: Math.min(market.low, next),
       ltq: [36, 72, 108, 144, 216, 360][Math.floor(Math.random() * 6)],
       volume: market.volume + market.ltq,
-      bids: Array.from({ length: 5 }, (_, i) => [roundTick(next - spread / 2 - i * 0.1), 72 * (2 + Math.floor(Math.random() * 7))]),
-      asks: Array.from({ length: 5 }, (_, i) => [roundTick(next + spread / 2 + i * 0.1), 72 * (2 + Math.floor(Math.random() * 7))]),
+      totalBuyQty: bids.reduce((sum, [, qty]) => sum + qty, 0),
+      totalSellQty: asks.reduce((sum, [, qty]) => sum + qty, 0),
+      oi: market.oi || 458,
+      previousOi: market.previousOi || 453,
+      oiChange: (market.oi || 458) - (market.previousOi || 453),
+      bids,
+      asks,
       source: "demo"
     };
     localMatchOpenOrders();
@@ -630,13 +655,13 @@ function marketTemplate(pulse = false) {
   const detailRows = [
     ["Volume", whole(market.volume)],
     ["Avg. traded price", fmt((market.open + market.high + market.low + market.ltp) / 4, 2)],
-    ["Last traded time", new Date(market.lastTick || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })],
+    ["Last traded time", formatTradeTime(market.lastTradeTime || market.timestamp || market.lastTick)],
     ["Last traded quantity", whole(market.ltq)],
     ["Spot", fmt(market.ltp, 2)],
     ["Last trading date", "30 Oct 26"],
     ["Expiry", "30 Oct 26"],
-    ["OI (chg)", "+5"],
-    ["Open Interest", "458"]
+    ["OI (chg)", signed(market.oiChange || 0)],
+    ["Open Interest", whole(market.oi)]
   ];
   return `
     <section class="market-card ${pulse ? "pulse-board" : ""}">
@@ -671,19 +696,21 @@ function depthTemplate() {
     ask: market.asks[index] || [0, 0]
   }));
   const maxQty = Math.max(...rows.map((row) => row.bid[1]), ...rows.map((row) => row.ask[1]), 1);
-  const totalBuy = market.bids.reduce((sum, [, qty]) => sum + qty, 0);
-  const totalSell = market.asks.reduce((sum, [, qty]) => sum + qty, 0);
+  const totalBuy = Number(market.totalBuyQty || 0) || market.bids.reduce((sum, [, qty]) => sum + qty, 0);
+  const totalSell = Number(market.totalSellQty || 0) || market.asks.reduce((sum, [, qty]) => sum + qty, 0);
   const buyPct = totalBuy + totalSell ? Math.round((totalBuy / (totalBuy + totalSell)) * 100) : 50;
   return `
     <section class="depth-card">
       <h2>Market Depth</h2>
       <div class="depth-table">
-        <div class="depth-head"><span>Qty</span><span>Bid</span><span>Ask</span><span>Qty</span></div>
+        <div class="depth-head"><span>Qty</span><span>Orders</span><span>Bid</span><span>Ask</span><span>Orders</span><span>Qty</span></div>
         ${rows.map(({ bid, ask }) => `
           <div class="depth-row">
             <span class="qty-cell buy-depth" style="--w:${Math.max(10, (bid[1] / maxQty) * 100)}%">${whole(bid[1])}</span>
+            <span class="order-count">${whole(bid[2] || 0)}</span>
             <strong>${fmt(bid[0], 2)}</strong>
             <strong>${fmt(ask[0], 2)}</strong>
+            <span class="order-count">${whole(ask[2] || 0)}</span>
             <span class="qty-cell sell-depth" style="--w:${Math.max(10, (ask[1] / maxQty) * 100)}%">${whole(ask[1])}</span>
           </div>
         `).join("")}

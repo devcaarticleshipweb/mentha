@@ -243,7 +243,7 @@ async function matchOpenOrders() {
 function normalizeDepth(levels) {
   if (!Array.isArray(levels)) return [];
   return levels
-    .map((level) => [Number(level.price || 0), Number(level.quantity || level.qty || 0)])
+    .map((level) => [Number(level.price || 0), Number(level.quantity || level.qty || 0), Number(level.orders || level.order_count || 0)])
     .filter(([price, qty]) => price > 0 && qty > 0)
     .slice(0, 5);
 }
@@ -253,19 +253,29 @@ function parseUpstoxQuote(raw) {
   if (!first) throw new Error("No quote returned by Upstox.");
   const bids = normalizeDepth(first.depth?.buy);
   const asks = normalizeDepth(first.depth?.sell);
+  const oi = Number(first.oi ?? first.open_interest ?? 0);
+  const previousOi = Number(first.previous_oi ?? first.prev_oi ?? 0);
   return {
     ltp: Number(first.last_price || demoMarket.ltp),
     prevClose: Number(first.ohlc?.close || demoMarket.prevClose),
     open: Number(first.ohlc?.open || demoMarket.open),
     high: Number(first.ohlc?.high || demoMarket.high),
     low: Number(first.ohlc?.low || demoMarket.low),
-    volume: Number(first.volume || 0),
-    ltq: Number(first.last_quantity || 0),
+    volume: Number(first.volume ?? first.vtt ?? 0),
+    ltq: Number(first.last_quantity ?? first.ltq ?? 0),
+    totalBuyQty: Number(first.total_buy_quantity ?? first.tbq ?? 0),
+    totalSellQty: Number(first.total_sell_quantity ?? first.tsq ?? 0),
+    oi,
+    previousOi,
+    oiChange: previousOi ? oi - previousOi : Number(first.oi_change ?? first.oi_change_value ?? 0),
+    oiDayHigh: Number(first.oi_day_high ?? 0),
+    oiDayLow: Number(first.oi_day_low ?? 0),
     bids: bids.length ? bids : demoMarket.bids,
     asks: asks.length ? asks : demoMarket.asks,
     source: "upstox",
     instrumentKey: UPSTOX_INSTRUMENT_KEY,
-    timestamp: first.timestamp || new Date().toISOString()
+    lastTradeTime: Number(first.last_trade_time ?? first.ltt ?? 0),
+    timestamp: first.timestamp || first.last_trade_time || new Date().toISOString()
   };
 }
 

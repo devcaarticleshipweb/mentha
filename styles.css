@@ -580,13 +580,15 @@ button {
 .depth-head,
 .depth-row {
   display: grid;
-  grid-template-columns: 1.35fr 1fr 1fr 1.35fr;
+  grid-template-columns: 1.2fr 0.7fr 1fr 1fr 0.7fr 1.2fr;
   align-items: center;
   gap: 10px;
 }
 
 .depth-head span:nth-child(2),
 .depth-head span:nth-child(3),
+.depth-head span:nth-child(4),
+.depth-head span:nth-child(5),
 .depth-row strong {
   text-align: right;
 }
@@ -604,6 +606,12 @@ button {
 
 .depth-row strong {
   font-weight: 520;
+}
+
+.order-count {
+  color: #b8b4bb;
+  text-align: right;
+  font-size: 20px;
 }
 
 .qty-cell {
@@ -1006,5 +1014,303 @@ button {
   50% {
     transform: scale(1.1);
     opacity: 0.85;
+  }
+}
+
+@media (max-width: 520px) {
+  .shell {
+    padding-bottom: max(118px, env(safe-area-inset-bottom));
+  }
+
+  .upstox-header {
+    min-height: 74px;
+    padding: max(10px, env(safe-area-inset-top)) 16px 12px;
+    gap: 8px;
+  }
+
+  .back-btn {
+    width: 24px;
+    height: 34px;
+    font-size: 32px;
+  }
+
+  .brand {
+    gap: 10px;
+  }
+
+  .instrument-icon,
+  .mark {
+    width: 42px;
+    height: 42px;
+    flex-basis: 42px;
+  }
+
+  .instrument-icon {
+    grid-template-columns: repeat(2, 9px);
+    grid-template-rows: repeat(2, 8px);
+    gap: 3px;
+  }
+
+  .instrument-icon span {
+    width: 9px;
+    height: 6px;
+  }
+
+  .brand h1 {
+    font-size: 17px;
+  }
+
+  .brand p {
+    font-size: 14px;
+  }
+
+  .header-price strong {
+    font-size: 17px;
+  }
+
+  .header-price span {
+    font-size: 13px;
+  }
+
+  .market-tabs button {
+    min-height: 46px;
+    padding-left: 16px;
+    font-size: 18px;
+  }
+
+  .market-card,
+  .depth-card,
+  .panel {
+    padding: 18px 16px;
+  }
+
+  .section-title-row {
+    margin-bottom: 18px;
+  }
+
+  .section-title-row h2,
+  .depth-card h2,
+  .panel h2 {
+    font-size: 20px;
+  }
+
+  .today-grid {
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+
+  .today-grid span,
+  .circuit-block > span,
+  .market-detail-list span,
+  .depth-head,
+  .depth-total span {
+    font-size: 14px;
+  }
+
+  .today-grid strong,
+  .circuit-block strong,
+  .market-detail-list strong {
+    font-size: 14px;
+  }
+
+  .market-toggle {
+    top: 4px;
+    width: 20px;
+    height: 20px;
+    font-size: 20px;
+  }
+
+  .prev-close-cell {
+    padding-right: 20px;
+  }
+
+  .circuit-line {
+    height: 10px;
+  }
+
+  .circuit-line i {
+    top: -6px;
+    height: 22px;
+  }
+
+  .market-detail-list div {
+    min-height: 42px;
+  }
+
+  .depth-card h2 {
+    margin-bottom: 18px;
+  }
+
+  .depth-table {
+    gap: 8px;
+  }
+
+  .depth-head,
+  .depth-row {
+    grid-template-columns: 1.05fr 0.58fr 1fr 1fr 0.58fr 1.05fr;
+    gap: 5px;
+  }
+
+  .depth-row {
+    min-height: 38px;
+    font-size: 14px;
+  }
+
+  .order-count {
+    font-size: 12px;
+  }
+
+  .qty-cell {
+    min-height: 36px;
+    padding: 0 5px;
+  }
+
+  .depth-total {
+    margin-top: 24px;
+  }
+
+  .depth-total strong {
+    font-size: 17px;
+  }
+
+  .depth-ratio {
+    height: 11px;
+  }
+
+  .side-tabs .seg,
+  .tab,
+  .seg {
+    min-height: 36px;
+  }
+
+  .field input,
+  .field select {
+    min-height: 42px;
+  }
+
+  .primary,
+  .secondary,
+  .danger,
+  .ghost {
+    min-height: 42px;
+  }
+
+  .upstox-actions {
+    bottom: 70px;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .action-row {
+    gap: 16px;
+  }
+
+  .buy-action,
+  .sell-action,
+  .utility-row button {
+    min-height: 46px;
+    border-radius: 8px;
+    font-size: 14px;
+  }
+
+  .utility-row {
+    gap: 12px;
+  }
+
+  .bottom-nav {
+    padding: 6px 4px max(6px, env(safe-area-inset-bottom));
+  }
+
+  .bottom-nav button {
+    min-height: 54px;
+    font-size: 11px;
+  }
+
+  .icon {
+    font-size: 20px;
+  }
+
+  .portfolio-header {
+    padding: max(10px, env(safe-area-inset-top)) 16px 18px;
+  }
+
+  .portfolio-status {
+    font-size: 14px;
+    margin-bottom: 18px;
+  }
+
+  .portfolio-title-row h1 {
+    font-size: 22px;
+  }
+
+  .portfolio-icons {
+    gap: 16px;
+    font-size: 24px;
+  }
+
+  .portfolio-tabs {
+    gap: 32px;
+    min-height: 64px;
+    padding: 16px 16px 0;
+  }
+
+  .portfolio-tabs button {
+    min-height: 46px;
+    font-size: 18px;
+  }
+
+  .portfolio-filter-row {
+    padding: 12px 16px;
+    gap: 10px;
+    overflow-x: auto;
+  }
+
+  .portfolio-filter-row button {
+    min-height: 44px;
+    padding: 0 24px;
+    font-size: 15px;
+    white-space: nowrap;
+  }
+
+  .portfolio-pnl-strip {
+    padding: 18px 16px;
+  }
+
+  .portfolio-pnl-strip span,
+  .portfolio-position p,
+  .portfolio-position small,
+  .position-right span,
+  .closed-label {
+    font-size: 14px;
+  }
+
+  .portfolio-pnl-strip strong {
+    font-size: 15px;
+  }
+
+  .portfolio-position {
+    padding: 18px 16px 16px;
+  }
+
+  .portfolio-position h3,
+  .position-right strong {
+    font-size: 19px;
+  }
+
+  .closed-label {
+    margin: 0 16px;
+    padding: 18px 0;
+  }
+
+  .stats {
+    gap: 6px;
+  }
+
+  .stat {
+    padding: 8px;
+  }
+
+  .value {
+    font-size: 13px;
   }
 }
