@@ -14,7 +14,7 @@ This version is ready for Render + Supabase.
 
 Keep the service role key secret. It goes only in Render environment variables.
 
-If you already deployed an older version, run `supabase-schema.sql` again. It safely adds the new brokerage, margin, and settings fields.
+If the last schema change you applied was individual margin and brokerage rates, run `supabase-migration-after-trader-rates.sql` in Supabase SQL Editor before starting the updated app. For a fresh project, run the complete `supabase-schema.sql` instead. The migration adds contracts and order permissions, assigns existing orders and trades to the original MENTHAOIL contract, and backfills missing execution details.
 The latest schema also adds `fund_ledger`, used for opening balance and fund addition/removal history.
 
 ## 2. Push Project To GitHub
@@ -66,14 +66,18 @@ your MASTER_PIN
 
 Create users from the Admin tab. Users can then login from their own phone.
 
+The master-only Contracts tab adds instruments to every trader's Watchlist. Enter the instrument's Upstox key, lot size, tick size, and starting and previous-close prices. The starting prices are used when the Upstox token is unavailable. Traders can open a watchlist row to view its market depth and place paper orders for that contract.
+
 ## 5. Configure Trading Rules
 
-Login as master and open Admin.
+Login as master and open Admin. Set rates and order permissions when creating a trader, or edit and save the settings on that trader's card. Run the latest `supabase-schema.sql` in Supabase SQL Editor before using order permissions on an existing deployment.
 
 Set:
 
 - Brokerage per lot: fixed rupee amount charged on every filled lot.
 - Margin per lot: rupee margin required for each lot before an order is accepted.
+- Allow market orders: permit this trader to place new market orders.
+- Allow limit orders: permit this trader to place new limit orders. Turn off both to block all new orders for that trader.
 
 Order behavior:
 
@@ -81,6 +85,7 @@ Order behavior:
 - Market sell fills immediately at the first buy/bid in market depth.
 - Buy limit fills when LTP is at or below the limit price.
 - Sell limit fills when LTP is at or above the limit price.
+- In the master Orders view, a pending limit order can be filled at an admin-entered execution price regardless of the current market price. The admin can also change the fill price of an executed order; this updates the matching trade and recalculates P&L. Each order shows its creation and execution times.
 
 Pages:
 

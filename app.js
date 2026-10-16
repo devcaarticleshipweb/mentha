@@ -5,23 +5,33 @@ const SCRIP = {
   expiry: "Current Contract"
 };
 
+const DEFAULT_CONTRACT_ID = "MENTHAOIL-OCT26";
+const defaultContract = {
+  id: DEFAULT_CONTRACT_ID, name: "MENTHAOIL FUT", subtitle: "MCX 30 OCT 26",
+  instrumentKey: "MCX_FO|552719", lotSize: 360, tickSize: 0.1,
+  initialPrice: 927.4, previousClose: 921.8, active: true
+};
+
 const TOKEN_KEY = "mentha-session-token";
 
 const seedState = {
   session: null,
   master: { id: "MASTER", name: "Master" },
   users: [
-    { id: "TRADER1", pin: "1111", name: "Trader 1", funds: 500000, active: true, createdAt: new Date().toISOString() }
+    { id: "TRADER1", pin: "1111", name: "Trader 1", funds: 500000, brokeragePerLot: 0, marginPerLot: 0, allowMarketOrders: true, allowLimitOrders: true, active: true, createdAt: new Date().toISOString() }
   ],
   orders: [],
   trades: [],
   ledger: [],
+  contracts: [defaultContract],
   settings: { brokeragePerLot: 0, marginPerLot: 0 }
 };
 
 let state = structuredClone(seedState);
 let market = makeInitialMarket();
-let activeView = "trade";
+let markets = { [DEFAULT_CONTRACT_ID]: market };
+let selectedContractId = DEFAULT_CONTRACT_ID;
+let activeView = "watchlist";
 let activeSide = "BUY";
 let marketDetailsExpanded = false;
 let toastTimer = null;
@@ -48,10 +58,40 @@ async function api(path, options = {}) {
 
 function localStore() {
   try {
-    return JSON.parse(localStorage.getItem("mentha-local-db") || "null") || structuredClone(seedState);
+    const db = JSON.parse(localStorage.getItem("mentha-local-db") || "null") || structuredClone(seedState);
+    db.contracts ||= structuredClone(seedState.contracts);
+    for (const order of db.orders) order.contractId ||= DEFAULT_CONTRACT_ID;
+    for (const trade of db.trades) trade.contractId ||= DEFAULT_CONTRACT_ID;
+    for (const user of db.users) {
+      user.brokeragePerLot ??= Number(db.settings?.brokeragePerLot || 0);
+      user.marginPerLot ??= Number(db.settings?.marginPerLot || 0);
+      user.allowMarketOrders ??= true;
+      user.allowLimitOrders ??= true;
+    }
+    return db;
   } catch {
     return structuredClone(seedState);
   }
+}
+
+function contractFor(id = selectedContractId) {
+  return state.contracts.find((contract) => contract.id === id) || defaultContract;
+}
+
+function initialQuote(contract) {
+  if (contract.id === DEFAULT_CONTRACT_ID) return makeInitialMarket();
+  const quote = makeInitialMarket();
+  const ltp = Number(contract.initialPrice);
+  const prevClose = Number(contract.previousClose);
+  const tick = Number(contract.tickSize);
+  return { ...quote, ltp, prevClose, open: ltp, high: ltp, low: ltp, avgPrice: ltp,
+    netChange: ltp - prevClose, changePercent: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
+    bids: quote.bids.map(([, qty, count], index) => [ltp - (index + 1) * tick, qty, count]),
+    asks: quote.asks.map(([, qty, count], index) => [ltp + (index + 1) * tick, qty, count]) };
+}
+
+function quoteFor(id = selectedContractId) {
+  return markets[id] || initialQuote(contractFor(id));
 }
 
 function saveLocalStore(db) {
@@ -76,16 +116,19 @@ function localId(prefix) {
 }
 
 function localExecutablePrice(order) {
-  if (order.type === "MARKET") return order.side === "BUY" ? market.asks[0][0] : market.bids[0][0];
-  if (order.side === "BUY" && Number(order.price) >= market.asks[0][0]) return market.asks[0][0];
-  if (order.side === "SELL" && Number(order.price) <= market.bids[0][0]) return market.bids[0][0];
+  const quote = quoteFor(order.contractId);
+  if (order.type === "MARKET") return order.side === "BUY" ? quote.asks[0][0] : quote.bids[0][0];
+  if (order.side === "BUY" && Number(order.price) >= quote.asks[0][0]) return quote.asks[0][0];
+  if (order.side === "SELL" && Number(order.price) <= quote.bids[0][0]) return quote.bids[0][0];
   return null;
 }
 
-function localFillOrder(db, order) {
-  const fillPrice = localExecutablePrice(order);
+function localFillOrder(db, order, forcedPrice = null) {
+  if (order.status !== "OPEN") return;
+  const fillPrice = forcedPrice ?? localExecutablePrice(order);
   if (!fillPrice) return;
-  const brokerage = Number(db.settings?.brokeragePerLot || 0) * Number(order.qty || 0);
+  const user = db.users.find((item) => item.id === order.userId);
+  const brokerage = Number(user?.brokeragePerLot || 0) * Number(order.qty || 0);
   order.status = "FILLED";
   order.fillPrice = fillPrice;
   order.filledAt = new Date().toISOString();
@@ -93,6 +136,7 @@ function localFillOrder(db, order) {
     id: localId("TRD"),
     orderId: order.id,
     userId: order.userId,
+    contractId: order.contractId,
     side: order.side,
     qty: order.qty,
     price: fillPrice,
@@ -142,11 +186,44 @@ async function localApi(path, options = {}) {
       master: seedState.master,
       users: db.users.filter((u) => u.id === session.id),
       orders: db.orders.filter((o) => o.userId === session.id),
-      trades: db.trades.filter((t) => t.userId === session.id)
+      trades: db.trades.filter((t) => t.userId === session.id),
+      ledger: (db.ledger || []).filter((item) => item.userId === session.id),
+      contracts: db.contracts
     };
   }
 
   if (path === "/api/market") return { ...market, source: "demo" };
+  if (path === "/api/markets") return { markets: Object.fromEntries(db.contracts.map((contract) => [contract.id, quoteFor(contract.id)])) };
+
+  if (path === "/api/contracts" && method === "POST") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const name = String(body.name || "").trim().toUpperCase();
+    const subtitle = String(body.subtitle || "").trim().toUpperCase();
+    const instrumentKey = String(body.instrumentKey || "").trim();
+    const lotSize = Number(body.lotSize);
+    const tickSize = Number(body.tickSize);
+    const initialPrice = Number(body.initialPrice);
+    const previousClose = Number(body.previousClose);
+    if (!name || !subtitle || !instrumentKey) throw new Error("Enter contract name, exchange/expiry and instrument key.");
+    if (db.contracts.some((item) => item.instrumentKey === instrumentKey)) throw new Error("Instrument key already exists.");
+    if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.01 || Math.abs(tickSize * 100 - Math.round(tickSize * 100)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) throw new Error("Enter valid lot size, tick size and prices.");
+    const contract = { id: localId("CONTRACT"), name, subtitle, instrumentKey, lotSize, tickSize, initialPrice, previousClose, active: true };
+    db.contracts.push(contract);
+    markets[contract.id] = initialQuote(contract);
+    saveLocalStore(db);
+    return { contract };
+  }
+
+  const contractPatch = path.match(/^\/api\/contracts\/([^/]+)$/);
+  if (contractPatch && method === "PATCH") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const contract = db.contracts.find((item) => item.id === decodeURIComponent(contractPatch[1]));
+    if (!contract) throw new Error("Contract not found.");
+    if (typeof body.active !== "boolean") throw new Error("Active status required.");
+    contract.active = body.active;
+    saveLocalStore(db);
+    return { contract };
+  }
 
   if (path === "/api/settings" && method === "PATCH") {
     if (session.role !== "master") throw new Error("Master access required.");
@@ -163,11 +240,21 @@ async function localApi(path, options = {}) {
     const id = String(body.id || "").trim().toUpperCase();
     if (!/^[A-Z0-9_-]{3,20}$/.test(id)) throw new Error("Use 3-20 letters, numbers, _ or - for user ID.");
     if (db.users.some((u) => u.id === id) || id === "MASTER") throw new Error("That user ID already exists.");
+    if (String(body.pin || "").trim().length < 4) throw new Error("PIN must be at least 4 digits.");
+    if (!Number.isFinite(Number(body.funds)) || Number(body.funds) < 0) throw new Error("Opening funds must be valid.");
+    if (!Number.isFinite(Number(body.brokeragePerLot)) || Number(body.brokeragePerLot) < 0) throw new Error("Brokerage per lot must be zero or more.");
+    if (!Number.isFinite(Number(body.marginPerLot)) || Number(body.marginPerLot) < 0) throw new Error("Margin per lot must be zero or more.");
+    if (body.allowMarketOrders !== undefined && typeof body.allowMarketOrders !== "boolean") throw new Error("Market order permission must be true or false.");
+    if (body.allowLimitOrders !== undefined && typeof body.allowLimitOrders !== "boolean") throw new Error("Limit order permission must be true or false.");
     db.users.push({
       id,
       pin: String(body.pin || "").trim(),
       name: String(body.name || id).trim(),
       funds: Number(body.funds || 0),
+      brokeragePerLot: Number(body.brokeragePerLot || 0),
+      marginPerLot: Number(body.marginPerLot || 0),
+      allowMarketOrders: body.allowMarketOrders ?? true,
+      allowLimitOrders: body.allowLimitOrders ?? true,
       active: true,
       createdAt: new Date().toISOString()
     });
@@ -191,6 +278,22 @@ async function localApi(path, options = {}) {
     if (!user) throw new Error("User not found.");
     if (typeof body.active === "boolean") user.active = body.active;
     if (body.name) user.name = String(body.name).trim();
+    if (body.brokeragePerLot !== undefined) {
+      if (!Number.isFinite(Number(body.brokeragePerLot)) || Number(body.brokeragePerLot) < 0) throw new Error("Brokerage per lot must be zero or more.");
+      user.brokeragePerLot = Number(body.brokeragePerLot);
+    }
+    if (body.marginPerLot !== undefined) {
+      if (!Number.isFinite(Number(body.marginPerLot)) || Number(body.marginPerLot) < 0) throw new Error("Margin per lot must be zero or more.");
+      user.marginPerLot = Number(body.marginPerLot);
+    }
+    if (body.allowMarketOrders !== undefined) {
+      if (typeof body.allowMarketOrders !== "boolean") throw new Error("Market order permission must be true or false.");
+      user.allowMarketOrders = body.allowMarketOrders;
+    }
+    if (body.allowLimitOrders !== undefined) {
+      if (typeof body.allowLimitOrders !== "boolean") throw new Error("Limit order permission must be true or false.");
+      user.allowLimitOrders = body.allowLimitOrders;
+    }
     saveLocalStore(db);
     return { ok: true };
   }
@@ -226,24 +329,60 @@ async function localApi(path, options = {}) {
   if (path === "/api/orders" && method === "POST") {
     if (session.role !== "user") throw new Error("Login as a trader to place orders.");
     const user = db.users.find((u) => u.id === session.id);
+    if (!user?.active) throw new Error("User is blocked.");
+    const contractId = String(body.contractId || DEFAULT_CONTRACT_ID);
+    const contract = db.contracts.find((item) => item.id === contractId && item.active);
+    if (!contract) throw new Error("Contract is not available.");
+    const type = String(body.type || "").toUpperCase();
+    if (!["MARKET", "LIMIT"].includes(type)) throw new Error("Invalid order type.");
+    if (type === "MARKET" && !user.allowMarketOrders) throw new Error("Market orders are disabled for this trader.");
+    if (type === "LIMIT" && !user.allowLimitOrders) throw new Error("Limit orders are disabled for this trader.");
     const pos = positionFor(session.id);
-    const openLots = db.orders.filter((o) => o.userId === session.id && o.status === "OPEN").reduce((sum, order) => sum + Number(order.qty || 0), 0);
-    const settings = db.settings || seedState.settings;
-    const available = Number(user?.funds || 0) + pos.realized - (Math.abs(pos.qty) + openLots) * Number(settings.marginPerLot || 0);
+    const available = Number(user?.funds || 0) + pos.realized - usedMargin(session.id);
     const order = {
       id: localId("ORD"),
       userId: session.id,
+      contractId,
       side: String(body.side || "").toUpperCase(),
-      type: String(body.type || "").toUpperCase(),
+      type,
       qty: Math.floor(Number(body.qty || 0)),
       price: body.type === "MARKET" ? null : Number(body.price || 0),
       status: "OPEN",
       createdAt: new Date().toISOString()
     };
-    const required = Number(settings.marginPerLot || 0) * order.qty + Number(settings.brokeragePerLot || 0) * order.qty;
+    const required = (Number(user?.marginPerLot || 0) + Number(user?.brokeragePerLot || 0)) * order.qty;
     if (available < required) throw new Error(`Insufficient funds. Required margin plus brokerage is ${required}, available is ${Math.max(0, available).toFixed(2)}.`);
     localFillOrder(db, order);
     db.orders.push(order);
+    saveLocalStore(db);
+    return { order };
+  }
+
+  const manualFill = path.match(/^\/api\/orders\/([^/]+)\/fill$/);
+  if (manualFill && method === "POST") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const order = db.orders.find((item) => item.id === decodeURIComponent(manualFill[1]));
+    if (!order || order.type !== "LIMIT" || order.status !== "OPEN") throw new Error("Only pending limit orders can be filled manually.");
+    const rawPrice = Number(body.price);
+    const price = Math.round(rawPrice * 100) / 100;
+    if (!Number.isFinite(rawPrice) || rawPrice <= 0 || rawPrice > 9999999999.99 || price <= 0) throw new Error("Enter a valid fill price above zero.");
+    localFillOrder(db, order, price);
+    saveLocalStore(db);
+    return { order };
+  }
+
+  const editFillPrice = path.match(/^\/api\/orders\/([^/]+)\/fill-price$/);
+  if (editFillPrice && method === "PATCH") {
+    if (session.role !== "master") throw new Error("Master access required.");
+    const order = db.orders.find((item) => item.id === decodeURIComponent(editFillPrice[1]));
+    if (!order || order.status !== "FILLED") throw new Error("Only filled orders can have their fill price changed.");
+    const trade = db.trades.find((item) => item.orderId === order.id);
+    if (!trade) throw new Error("The trade for this order is missing.");
+    const rawPrice = Number(body.price);
+    const price = Math.round(rawPrice * 100) / 100;
+    if (!Number.isFinite(rawPrice) || rawPrice <= 0 || rawPrice > 9999999999.99 || price <= 0) throw new Error("Enter a valid fill price above zero.");
+    order.fillPrice = price;
+    trade.price = price;
     saveLocalStore(db);
     return { order };
   }
@@ -357,8 +496,8 @@ function isMaster() {
   return state.session?.role === "master";
 }
 
-function tradeMultiplier() {
-  return SCRIP.lotSize;
+function tradeMultiplier(contractId = selectedContractId) {
+  return Number(contractFor(contractId).lotSize || SCRIP.lotSize);
 }
 
 function userOrders(userId, includeAll = false) {
@@ -372,11 +511,12 @@ function userTrades(userId) {
 }
 
 function positionFor(userId) {
-  return positionReport(userId).summary;
+  return portfolioReport(userId).summary;
 }
 
-function positionReport(userId) {
-  const lots = userTrades(userId);
+function positionReport(userId, contractId = selectedContractId) {
+  const lots = userTrades(userId).filter((trade) => (trade.contractId || DEFAULT_CONTRACT_ID) === contractId);
+  const quote = quoteFor(contractId);
   let qty = 0;
   let avg = 0;
   let realized = 0;
@@ -394,11 +534,12 @@ function positionReport(userId) {
 
     const closingQty = Math.min(Math.abs(qty), Math.abs(signedQty));
     const pnlPerUnit = qty > 0 ? t.price - avg : avg - t.price;
-    const grossPnl = pnlPerUnit * closingQty * tradeMultiplier();
+    const grossPnl = pnlPerUnit * closingQty * tradeMultiplier(contractId);
     realized += grossPnl;
     closed.push({
       id: t.id,
       userId: t.userId,
+      contractId,
       side: qty > 0 ? "LONG" : "SHORT",
       qty: closingQty,
       entry: avg,
@@ -414,14 +555,15 @@ function positionReport(userId) {
     if (qty !== 0 && Math.sign(qty) === Math.sign(signedQty)) avg = t.price;
   }
 
-  const mtm = qty === 0 ? 0 : (qty > 0 ? market.ltp - avg : avg - market.ltp) * Math.abs(qty) * tradeMultiplier();
+  const mtm = qty === 0 ? 0 : (qty > 0 ? quote.ltp - avg : avg - quote.ltp) * Math.abs(qty) * tradeMultiplier(contractId);
   realized -= brokerage;
   const open = qty === 0 ? [] : [{
     userId,
+    contractId,
     side: qty > 0 ? "LONG" : "SHORT",
     qty: Math.abs(qty),
     avg,
-    ltp: market.ltp,
+    ltp: quote.ltp,
     pnl: mtm
   }];
   return {
@@ -429,6 +571,15 @@ function positionReport(userId) {
     open,
     closed
   };
+}
+
+function portfolioReport(userId) {
+  const reports = (state.contracts || []).map((contract) => positionReport(userId, contract.id));
+  const summary = reports.reduce((total, report) => {
+    for (const key of ["qty", "realized", "mtm", "net", "brokerage"]) total[key] += report.summary[key];
+    return total;
+  }, { qty: 0, avg: 0, realized: 0, mtm: 0, net: 0, brokerage: 0 });
+  return { summary, open: reports.flatMap((report) => report.open), closed: reports.flatMap((report) => report.closed) };
 }
 
 function availableFunds(userId) {
@@ -445,33 +596,34 @@ function openOrderLots(userId) {
 }
 
 function usedMargin(userId) {
-  const pos = positionFor(userId);
-  const lots = Math.abs(pos.qty) + openOrderLots(userId);
-  return lots * Number(state.settings?.marginPerLot || 0);
+  const heldLots = (state.contracts || []).reduce((sum, contract) => sum + Math.abs(positionReport(userId, contract.id).summary.qty), 0);
+  const lots = heldLots + openOrderLots(userId);
+  const user = state.users.find((item) => item.id === userId);
+  return lots * Number(user?.marginPerLot || 0);
 }
 
-function normalizeMarket(data) {
-  const next = { ...market, ...data, lastTick: Date.now() };
-  next.ltp = finiteNumber(next.ltp ?? next.last_price, market.ltp);
-  next.prevClose = finiteNumber(next.prevClose ?? next.cp ?? next.close ?? next.close_price, market.prevClose);
-  next.open = finiteNumber(next.open, market.open);
-  next.high = finiteNumber(next.high, Math.max(market.high, next.ltp));
-  next.low = finiteNumber(next.low, Math.min(market.low, next.ltp));
-  next.lowerCircuit = positiveNumber(next.lowerCircuit ?? next.lower_circuit_limit ?? next.lower_circuit, market.lowerCircuit);
-  next.upperCircuit = positiveNumber(next.upperCircuit ?? next.upper_circuit_limit ?? next.upper_circuit, market.upperCircuit);
+function normalizeMarket(data, previous = market) {
+  const next = { ...previous, ...data, lastTick: Date.now() };
+  next.ltp = finiteNumber(next.ltp ?? next.last_price, previous.ltp);
+  next.prevClose = finiteNumber(next.prevClose ?? next.prev_close_price ?? next.cp ?? next.close_price ?? next.previous_close ?? next.close, previous.prevClose);
+  next.open = finiteNumber(next.open, previous.open);
+  next.high = finiteNumber(next.high, Math.max(previous.high, next.ltp));
+  next.low = finiteNumber(next.low, Math.min(previous.low, next.ltp));
+  next.lowerCircuit = positiveNumber(next.lowerCircuit ?? next.lower_circuit_limit ?? next.lower_circuit, previous.lowerCircuit);
+  next.upperCircuit = positiveNumber(next.upperCircuit ?? next.upper_circuit_limit ?? next.upper_circuit, previous.upperCircuit);
   next.netChange = finiteNumber(next.netChange ?? next.net_change ?? next.change, next.ltp - next.prevClose);
   next.changePercent = finiteNumber(next.changePercent ?? next.change_percent ?? next.percent_change, next.prevClose ? (next.netChange / next.prevClose) * 100 : 0);
-  next.volume = finiteNumber(next.volume, market.volume);
-  next.avgPrice = positiveNumber(next.avgPrice ?? next.average_price ?? next.avg_price ?? next.atp, market.avgPrice);
-  next.ltq = finiteNumber(next.ltq ?? next.last_quantity ?? next.last_traded_quantity, 0);
-  next.totalBuyQty = finiteNumber(next.totalBuyQty ?? next.total_buy_quantity, market.totalBuyQty ?? 0);
-  next.totalSellQty = finiteNumber(next.totalSellQty ?? next.total_sell_quantity, market.totalSellQty ?? 0);
-  next.oi = finiteNumber(next.oi ?? next.open_interest, market.oi ?? 0);
-  next.previousOi = finiteNumber(next.previousOi ?? next.previous_oi, market.previousOi ?? 0);
-  next.oiChange = finiteNumber(next.oiChange ?? next.oi_change ?? next.oi_chg, next.previousOi ? next.oi - next.previousOi : market.oiChange ?? 0);
-  next.lastTradeTime = finiteNumber(next.lastTradeTime ?? next.last_trade_time, market.lastTradeTime ?? 0);
-  next.bids = Array.isArray(data.bids) && data.bids.length ? data.bids : market.bids;
-  next.asks = Array.isArray(data.asks) && data.asks.length ? data.asks : market.asks;
+  next.volume = finiteNumber(next.volume, previous.volume);
+  next.avgPrice = positiveNumber(next.avgPrice ?? next.average_price ?? next.avg_price ?? next.atp, previous.avgPrice);
+  next.ltq = finiteNumber(next.ltq ?? next.last_quantity ?? next.last_traded_quantity, previous.ltq ?? 0);
+  next.totalBuyQty = finiteNumber(next.totalBuyQty ?? next.total_buy_quantity, previous.totalBuyQty ?? 0);
+  next.totalSellQty = finiteNumber(next.totalSellQty ?? next.total_sell_quantity, previous.totalSellQty ?? 0);
+  next.oi = finiteNumber(next.oi ?? next.open_interest, previous.oi ?? 0);
+  next.previousOi = finiteNumber(next.previousOi ?? next.previous_oi ?? next.prev_oi, previous.previousOi ?? 0);
+  next.oiChange = finiteNumber(next.oiChange ?? next.oi_change ?? next.oi_chg, next.previousOi ? next.oi - next.previousOi : previous.oiChange ?? 0);
+  next.lastTradeTime = finiteNumber(next.lastTradeTime ?? next.last_trade_time, previous.lastTradeTime ?? 0);
+  next.bids = Array.isArray(data.bids) && data.bids.length ? data.bids : previous.bids;
+  next.asks = Array.isArray(data.asks) && data.asks.length ? data.asks : previous.asks;
   return next;
 }
 
@@ -481,6 +633,8 @@ async function bootstrap() {
     startLocalMarket();
     if (state.session) {
       await refreshState();
+      activeView = isMaster() ? "admin" : "watchlist";
+      render();
       startRefresh();
     } else {
       render();
@@ -495,6 +649,8 @@ async function bootstrap() {
 
   try {
     await refreshState();
+    activeView = isMaster() ? "admin" : "watchlist";
+    render();
     startRefresh();
   } catch {
     localStorage.removeItem(TOKEN_KEY);
@@ -506,38 +662,30 @@ async function bootstrap() {
 function startLocalMarket() {
   clearInterval(localMarketTimer);
   localMarketTimer = setInterval(() => {
-    const next = Math.max(700, roundTick(market.ltp + (Math.random() - 0.48) * 1.6));
-    const spread = 0.2 + (Math.random() > 0.7 ? 0.1 : 0);
-    const bids = Array.from({ length: 5 }, (_, i) => [roundTick(next - spread / 2 - i * 0.1), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
-    const asks = Array.from({ length: 5 }, (_, i) => [roundTick(next + spread / 2 + i * 0.1), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
-    const ltq = [36, 72, 108, 144, 216, 360][Math.floor(Math.random() * 6)];
-    const netChange = next - market.prevClose;
-    market = {
-      ...market,
-      ltp: next,
-      netChange,
-      changePercent: market.prevClose ? (netChange / market.prevClose) * 100 : 0,
-      high: Math.max(market.high, next),
-      low: Math.min(market.low, next),
-      avgPrice: (market.avgPrice + next) / 2,
-      ltq,
-      volume: market.volume + ltq,
-      totalBuyQty: bids.reduce((sum, [, qty]) => sum + qty, 0),
-      totalSellQty: asks.reduce((sum, [, qty]) => sum + qty, 0),
-      oi: market.oi || 458,
-      previousOi: market.previousOi || 453,
-      oiChange: (market.oi || 458) - (market.previousOi || 453),
-      bids,
-      asks,
-      source: "demo"
-    };
+    for (const contract of localStore().contracts.filter((item) => item.active)) {
+      const current = quoteFor(contract.id);
+      const tick = Number(contract.tickSize);
+      const next = Math.max(tick, roundTick(current.ltp + (Math.random() - 0.48) * tick * 16, tick));
+      const bids = Array.from({ length: 5 }, (_, i) => [roundTick(next - tick * (i + 1), tick), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
+      const asks = Array.from({ length: 5 }, (_, i) => [roundTick(next + tick * (i + 1), tick), 72 * (2 + Math.floor(Math.random() * 7)), 1 + Math.floor(Math.random() * 8)]);
+      const ltq = [36, 72, 108, 144, 216, 360][Math.floor(Math.random() * 6)];
+      const netChange = next - current.prevClose;
+      markets[contract.id] = { ...current, ltp: next, netChange,
+        changePercent: current.prevClose ? (netChange / current.prevClose) * 100 : 0,
+        high: Math.max(current.high, next), low: Math.min(current.low, next),
+        avgPrice: (current.avgPrice + next) / 2, ltq, volume: current.volume + ltq,
+        totalBuyQty: bids.reduce((sum, [, qty]) => sum + qty, 0),
+        totalSellQty: asks.reduce((sum, [, qty]) => sum + qty, 0),
+        bids, asks, source: "demo" };
+    }
+    market = quoteFor(selectedContractId);
     localMatchOpenOrders();
     if (state.session) renderIfNotEditing();
   }, 1800);
 }
 
-function roundTick(value) {
-  return Math.round(value / SCRIP.tickSize) * SCRIP.tickSize;
+function roundTick(value, tick = contractFor().tickSize) {
+  return Math.round(value / tick) * tick;
 }
 
 function startRefresh() {
@@ -551,10 +699,17 @@ async function refreshState(showErrors = true) {
   try {
     const [stateData, marketData] = await Promise.all([
       api("/api/state"),
-      api("/api/market")
+      api("/api/markets")
     ]);
     state = { ...state, ...stateData };
-    market = normalizeMarket(marketData);
+    for (const contract of state.contracts || []) {
+      markets[contract.id] = normalizeMarket(marketData.markets?.[contract.id] || {}, quoteFor(contract.id));
+    }
+    if (!state.contracts.some((contract) => contract.id === selectedContractId && contract.active)) {
+      selectedContractId = state.contracts.find((contract) => contract.active)?.id || DEFAULT_CONTRACT_ID;
+      if (activeView === "trade") activeView = "watchlist";
+    }
+    market = quoteFor(selectedContractId);
     renderIfNotEditing();
   } catch (error) {
     if (showErrors) notify(error.message);
@@ -591,7 +746,7 @@ function authTemplate() {
       <section class="auth-card">
         <div class="mark">M</div>
         <h1>MENTHA Paper Trade</h1>
-        <p class="muted">Render + Supabase paper trading for MCX Mentha Oil. Master ID: MASTER.</p>
+        <p class="muted">Paper trading with a shared contract watchlist. Master ID: MASTER.</p>
         <div class="trade-form" style="margin-top:16px">
           <label class="field"><span class="label">Login ID</span><input id="loginId" autocomplete="username" value="MASTER"></label>
           <label class="field"><span class="label">PIN</span><input id="loginPin" type="password" autocomplete="current-password"></label>
@@ -608,9 +763,11 @@ function shellTemplate() {
   const content = viewTemplate(user, pos);
   const { change, pct } = marketMove();
   const isPortfolio = activeView === "positions";
+  const isWatchlist = activeView === "watchlist";
+  const contract = contractFor();
   return `
     <main class="shell">
-      ${isPortfolio ? portfolioHeaderTemplate() : `
+      ${isPortfolio ? portfolioHeaderTemplate() : isWatchlist ? watchlistHeaderTemplate() : `
         <header class="upstox-header">
           <button class="back-btn" aria-label="Back">‹</button>
           <div class="brand">
@@ -618,8 +775,8 @@ function shellTemplate() {
               <span></span><span></span><span></span>
             </div>
             <div>
-              <h1>MENTHAOIL FUT</h1>
-              <p>MCX 30 OCT 26</p>
+              <h1>${esc(contract.name)}</h1>
+              <p>${esc(contract.subtitle)}</p>
             </div>
           </div>
           <div class="header-price">
@@ -636,10 +793,10 @@ function shellTemplate() {
       `}
 
       <nav class="bottom-nav">
-        ${navButton("trade", "▣", "My lists")}
+        ${navButton("watchlist", "▣", "My lists")}
         ${navButton("orders", "🛒", "Orders")}
         ${navButton("positions", "▣", "Portfolio")}
-        ${navButton("discover", "◎", "Discover")}
+        ${isMaster() ? navButton("contracts", "◎", "Contracts") : navButton("discover", "◎", "Discover")}
         ${navButton(isMaster() ? "admin" : "account", "◉", isMaster() ? "Admin" : "Account")}
       </nav>
 
@@ -653,20 +810,47 @@ function shellTemplate() {
 function portfolioHeaderTemplate() {
   return `
     <header class="portfolio-header">
-      <div class="portfolio-status">11:31 AM <span>▴ ≋ 🔋</span></div>
       <div class="portfolio-title-row">
         <h1>Portfolio</h1>
-        <div class="portfolio-icons"><span>▰</span><span>♢</span><span>⇱</span><span>≡</span><span>⌕</span></div>
       </div>
     </header>
   `;
 }
 
+function watchlistHeaderTemplate() {
+  return `
+    <header class="watchlist-header">
+      <div class="watchlist-search"><span aria-hidden="true">⌕</span><input id="contractSearch" type="search" placeholder="Search contracts" aria-label="Search contracts"></div>
+    </header>
+  `;
+}
+
+function watchlistTemplate() {
+  const contracts = (state.contracts || []).filter((contract) => contract.active);
+  return `
+    <section class="watchlist-tabs"><span class="active">Watchlist</span><span>Contracts</span></section>
+    <section class="watchlist-chips"><span class="active">My list</span><span>${contracts.length} contracts</span></section>
+    <section class="watchlist-list">
+      ${contracts.length ? contracts.map((contract) => {
+        const quote = quoteFor(contract.id);
+        const change = Number(quote.netChange ?? quote.ltp - quote.prevClose);
+        const pct = Number(quote.changePercent ?? (quote.prevClose ? change / quote.prevClose * 100 : 0));
+        return `<button class="watchlist-item" type="button" data-contract="${esc(contract.id)}">
+          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)}</small></span>
+          <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${fmt(quote.ltp, 2)}</strong><small>${signed(change)} (${Math.abs(pct).toFixed(2)}%)</small></span>
+        </button>`;
+      }).join("") : empty("No contracts available")}
+    </section>
+  `;
+}
+
 function viewTemplate(user, pos) {
-  if (activeView === "home" || activeView === "trade") return `${marketTemplate(true)}${depthTemplate()}${tradeTemplate(pos)}${tradeActionBar(pos)}`;
+  if (activeView === "watchlist") return watchlistTemplate();
+  if (activeView === "home" || activeView === "trade") return `${marketTemplate(true)}${depthTemplate()}${tradeTemplate(isMaster() ? null : positionReport(user.id).summary)}${tradeActionBar(pos)}`;
   if (activeView === "positions") return positionsPageTemplate();
   if (activeView === "orders") return ordersTemplate();
   if (activeView === "admin") return adminTemplate();
+  if (activeView === "contracts" && isMaster()) return contractsAdminTemplate();
   if (activeView === "account" || activeView === "funds") return accountLedgerTemplate(user, pos);
   if (activeView === "discover") return `<section class="panel"><h2>Discover</h2><p class="muted">Discovery tools can be added here later.</p></section>`;
   return tradeTemplate(pos);
@@ -757,7 +941,7 @@ function depthTemplate() {
 }
 
 function tradeActionBar(pos) {
-  if (isMaster()) return "";
+  if (isMaster() || currentUser()?.allowMarketOrders === false && currentUser()?.allowLimitOrders === false) return "";
   return `
     <section class="upstox-actions">
       <div class="action-row">
@@ -778,8 +962,14 @@ function tradeTemplate(pos) {
     return `<section class="panel"><h2>Trade</h2><p class="muted">Master can supervise users, adjust funds, and void orders from Admin. Login as a trader to place practice trades.</p></section>`;
   }
   const lastQty = Math.max(1, Math.abs(pos?.qty || 1));
-  const brokerage = Number(state.settings?.brokeragePerLot || 0);
-  const margin = Number(state.settings?.marginPerLot || 0);
+  const trader = currentUser();
+  const brokerage = Number(trader?.brokeragePerLot || 0);
+  const margin = Number(trader?.marginPerLot || 0);
+  const allowMarketOrders = trader?.allowMarketOrders !== false;
+  const allowLimitOrders = trader?.allowLimitOrders !== false;
+  if (!allowMarketOrders && !allowLimitOrders) {
+    return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Market and limit orders are disabled for your account. Contact the admin to enable trading.</p></section>`;
+  }
   return `
     <section class="panel">
       <div class="row"><h2>Order Ticket</h2><span class="chip">Margin ${whole(margin)} / lot</span></div>
@@ -789,12 +979,12 @@ function tradeTemplate(pos) {
           <button type="button" class="seg ${activeSide === "SELL" ? "active" : ""}" data-side="SELL">Sell</button>
         </div>
         <div class="form-grid">
-          <label class="field"><span class="label">Order type</span><select id="orderType"><option>MARKET</option><option>LIMIT</option></select></label>
+          <label class="field"><span class="label">Order type</span><select id="orderType">${allowMarketOrders ? "<option>MARKET</option>" : ""}${allowLimitOrders ? "<option>LIMIT</option>" : ""}</select></label>
           <label class="field"><span class="label">Lots</span><input id="orderQty" type="number" min="1" step="1" value="${lastQty}"></label>
         </div>
-        <label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="0.1" value="${fmt(activeSide === "BUY" ? market.asks[0][0] : market.bids[0][0], 1)}"></label>
-        <p class="muted">Market buy fills at best ask, market sell fills at best bid. Limit orders fill when LTP reaches the limit. Brokerage ${whole(brokerage)} per lot.</p>
-        <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(SCRIP.symbol)}</button>
+        ${allowLimitOrders ? `<label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="${contractFor().tickSize}" value="${Number(activeSide === "BUY" ? market.asks[0][0] : market.bids[0][0]).toFixed(2)}"></label>` : ""}
+        <p class="muted">${allowMarketOrders ? "Market buy fills at best ask, market sell fills at best bid. " : ""}${allowLimitOrders ? "Limit orders fill when LTP reaches the limit. " : ""}Brokerage ${whole(brokerage)} per lot.</p>
+        <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(contractFor().name)}</button>
       </form>
     </section>
   `;
@@ -811,13 +1001,20 @@ function ordersTemplate() {
 }
 
 function orderItem(o) {
+  const adminFill = isMaster() && o.type === "LIMIT" && o.status === "OPEN";
+  const adminEdit = isMaster() && o.status === "FILLED";
   return `
     <article class="item">
       <div class="order-row">
-        <div><strong class="${o.side === "BUY" ? "up" : "down"}">${esc(o.side)} ${o.qty} lot</strong><br><small>${esc(o.userId)} · ${esc(o.type)} · ${new Date(o.createdAt).toLocaleString()}</small></div>
+        <div><strong class="${o.side === "BUY" ? "up" : "down"}">${esc(o.side)} ${o.qty} lot</strong><br><small>${esc(contractFor(o.contractId).name)} · ${esc(o.userId)} · ${esc(o.type)}</small></div>
         <span class="chip">${esc(o.status)}</span>
       </div>
-      <div class="row" style="margin-top:8px"><span>${o.price ? fmt(o.price, 1) : "Market"}</span>${o.status === "OPEN" || isMaster() && o.status === "FILLED" ? `<button class="ghost" data-cancel="${esc(o.id)}">${o.status === "FILLED" ? "Void" : "Cancel"}</button>` : ""}</div>
+      <div class="order-times"><small>Created: ${new Date(o.createdAt).toLocaleString()}</small><small>Executed: ${o.filledAt ? new Date(o.filledAt).toLocaleString() : o.status === "OPEN" ? "Pending" : "Not executed"}</small></div>
+      <div class="row" style="margin-top:8px"><span>${o.type === "LIMIT" ? `Limit ₹${fmt(o.price)}` : "Market"}${o.status === "FILLED" && o.fillPrice != null ? ` · Filled ₹${fmt(o.fillPrice)}` : ""}</span>${o.status === "OPEN" || isMaster() && o.status === "FILLED" ? `<button class="ghost" data-cancel="${esc(o.id)}">${o.status === "FILLED" ? "Void" : "Cancel"}</button>` : ""}</div>
+      ${adminFill || adminEdit ? `<form class="order-admin-form" data-${adminFill ? "manual-fill" : "edit-fill-price"}="${esc(o.id)}">
+        <label class="field"><span class="label">${adminFill ? "Execution price" : "New filled price"}</span><input name="price" type="number" min="0.01" max="9999999999.99" step="0.01" value="${adminFill ? Number(o.price) : Number(o.fillPrice)}" required></label>
+        <button class="secondary" type="submit">${adminFill ? "Fill now" : "Change price"}</button>
+      </form>` : ""}
     </article>
   `;
 }
@@ -865,14 +1062,8 @@ function userFundItem(u) {
 function adminTemplate() {
   return `
     <section class="panel">
-      <h2>Trading Rules</h2>
-      <form class="trade-form" id="settingsForm">
-        <div class="form-grid">
-          <label class="field"><span class="label">Brokerage per lot</span><input id="brokeragePerLot" type="number" min="0" step="1" value="${Number(state.settings?.brokeragePerLot || 0)}"></label>
-          <label class="field"><span class="label">Margin per lot</span><input id="marginPerLot" type="number" min="0" step="1" value="${Number(state.settings?.marginPerLot || 0)}"></label>
-        </div>
-        <button class="secondary">Save trading rules</button>
-      </form>
+      <div class="row"><h2>Admin</h2><button class="danger" id="logoutWide" type="button">Log out</button></div>
+      <p class="muted">Set margin, brokerage, and allowed order types separately for each trader below.</p>
     </section>
     <section class="panel">
       <h2>Create User</h2>
@@ -883,6 +1074,14 @@ function adminTemplate() {
         </div>
         <label class="field"><span class="label">Name</span><input id="newUserName" placeholder="Trader name"></label>
         <label class="field"><span class="label">Opening funds</span><input id="newUserFunds" type="number" value="500000"></label>
+        <div class="form-grid">
+          <label class="field"><span class="label">Brokerage per lot</span><input id="newUserBrokerage" type="number" min="0" step="0.01" value="0" required></label>
+          <label class="field"><span class="label">Margin per lot</span><input id="newUserMargin" type="number" min="0" step="0.01" value="0" required></label>
+        </div>
+        <div class="permission-options" role="group" aria-label="Allowed order types">
+          <label class="permission-option"><input id="newUserMarketOrders" type="checkbox" checked><span>Allow market orders</span></label>
+          <label class="permission-option"><input id="newUserLimitOrders" type="checkbox" checked><span>Allow limit orders</span></label>
+        </div>
         <button class="secondary">Create user</button>
       </form>
     </section>
@@ -897,6 +1096,39 @@ function adminTemplate() {
   `;
 }
 
+function contractsAdminTemplate() {
+  return `
+    <section class="panel">
+      <div class="row"><h2>Contracts</h2><button class="danger" id="logoutWide" type="button">Log out</button></div>
+      <p class="muted">Add instruments to every trader's watchlist. Use the exact Upstox instrument key for live quotes.</p>
+      <form class="trade-form" id="contractForm" style="margin-top:16px">
+        <div class="form-grid">
+          <label class="field"><span class="label">Contract name</span><input name="name" placeholder="SILVERMIC FUT" required></label>
+          <label class="field"><span class="label">Exchange and expiry</span><input name="subtitle" placeholder="MCX 30 NOV 26" required></label>
+        </div>
+        <label class="field"><span class="label">Upstox instrument key</span><input name="instrumentKey" placeholder="MCX_FO|..." required></label>
+        <div class="form-grid">
+          <label class="field"><span class="label">Lot size</span><input name="lotSize" type="number" min="1" step="1" value="1" required></label>
+          <label class="field"><span class="label">Tick size</span><input name="tickSize" type="number" min="0.01" step="0.01" value="0.1" required></label>
+        </div>
+        <div class="form-grid">
+          <label class="field"><span class="label">Starting price</span><input name="initialPrice" type="number" min="0.01" step="0.01" required></label>
+          <label class="field"><span class="label">Previous close</span><input name="previousClose" type="number" min="0.01" step="0.01" required></label>
+        </div>
+        <button class="secondary" type="submit">Add contract</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>Watchlist contracts</h2>
+      <div class="list">${(state.contracts || []).map((contract) => `
+        <article class="item">
+          <div class="admin-row"><div><strong>${esc(contract.name)}</strong><br><small>${esc(contract.subtitle)} · ${esc(contract.instrumentKey)}</small></div><span class="chip">${contract.active ? "Visible" : "Hidden"}</span></div>
+          <button class="ghost" type="button" data-contract-toggle="${esc(contract.id)}" style="margin-top:10px">${contract.active ? "Hide from watchlist" : "Show in watchlist"}</button>
+        </article>`).join("")}</div>
+    </section>
+  `;
+}
+
 function adminUserItem(u) {
   const pos = positionFor(u.id);
   return `
@@ -905,6 +1137,17 @@ function adminUserItem(u) {
         <div><strong>${esc(u.name)}</strong><br><small>${esc(u.id)}</small></div>
         <span class="${pos.net >= 0 ? "up" : "down"}">₹${signed(pos.net)}</span>
       </div>
+      <form class="trade-form" data-rules-form="${esc(u.id)}" style="margin-top:10px">
+        <div class="form-grid">
+          <label class="field"><span class="label">Brokerage per lot</span><input name="brokeragePerLot" type="number" min="0" step="0.01" value="${Number(u.brokeragePerLot || 0)}" required></label>
+          <label class="field"><span class="label">Margin per lot</span><input name="marginPerLot" type="number" min="0" step="0.01" value="${Number(u.marginPerLot || 0)}" required></label>
+        </div>
+        <div class="permission-options" role="group" aria-label="Allowed order types for ${esc(u.id)}">
+          <label class="permission-option"><input name="allowMarketOrders" type="checkbox" ${u.allowMarketOrders !== false ? "checked" : ""}><span>Allow market orders</span></label>
+          <label class="permission-option"><input name="allowLimitOrders" type="checkbox" ${u.allowLimitOrders !== false ? "checked" : ""}><span>Allow limit orders</span></label>
+        </div>
+        <button class="secondary" type="submit">Save settings</button>
+      </form>
       <div class="actions" style="margin-top:10px">
         <button class="ghost" data-toggle="${esc(u.id)}">${u.active ? "Block" : "Unblock"}</button>
         <button class="danger" data-remove="${esc(u.id)}">Remove</button>
@@ -940,8 +1183,8 @@ function accountLedgerTemplate(user, pos) {
 
 function positionsPageTemplate() {
   const rows = isMaster()
-    ? state.users.map((u) => ({ user: u, report: positionReport(u.id) }))
-    : [{ user: currentUser(), report: positionReport(currentUser().id) }];
+    ? state.users.map((u) => ({ user: u, report: portfolioReport(u.id) }))
+    : [{ user: currentUser(), report: portfolioReport(currentUser().id) }];
   const total = rows.reduce((sum, row) => sum + row.report.summary.net, 0);
   const openPnl = rows.reduce((sum, row) => sum + row.report.summary.mtm, 0);
   const closedPnl = rows.reduce((sum, row) => sum + row.report.summary.realized, 0);
@@ -973,8 +1216,8 @@ function openPositionItem(item) {
   return `
     <article class="portfolio-position open-position">
       <div>
-        <h3>MENTHAOIL FUT</h3>
-        <p>MCX 30 OCT 26</p>
+        <h3>${esc(contractFor(item.contractId).name)}</h3>
+        <p>${esc(contractFor(item.contractId).subtitle)}</p>
         <small>Delivery&nbsp;&nbsp; Qty. <span class="${item.side === "LONG" ? "up" : "down"}">${item.side === "LONG" ? "+" : "-"}${item.qty}</span></small>
       </div>
       <div class="position-right">
@@ -990,8 +1233,8 @@ function closedPositionItem(item) {
   return `
     <article class="portfolio-position closed-position">
       <div>
-        <h3>MENTHAOIL FUT</h3>
-        <p>MCX 30 OCT 26</p>
+        <h3>${esc(contractFor(item.contractId).name)}</h3>
+        <p>${esc(contractFor(item.contractId).subtitle)}</p>
         <small>Delivery&nbsp;&nbsp; Qty. 0</small>
       </div>
       <div class="position-right">
@@ -1041,12 +1284,12 @@ function ledgerRowsFor(userId, pos) {
       id: `${trade.id}-brokerage`,
       time: trade.time,
       title: "Brokerage charged",
-      note: `${trade.side} ${trade.qty} lot at ${fmt(trade.price, 1)}`,
+      note: `${contractFor(trade.contractId).name} · ${trade.side} ${trade.qty} lot at ${fmt(trade.price, 1)}`,
       amount: -Number(trade.brokerage || 0),
       kind: "debit"
     }));
 
-  const pnlRows = positionReport(userId).closed.map((item) => ({
+  const pnlRows = portfolioReport(userId).closed.map((item) => ({
     id: `${item.id}-pnl`,
     time: item.time,
     title: "Trade P&L",
@@ -1095,7 +1338,7 @@ function bindAuth() {
       });
       localStorage.setItem(TOKEN_KEY, data.token);
       state.session = data.session;
-      activeView = data.session.role === "master" ? "admin" : "trade";
+      activeView = data.session.role === "master" ? "admin" : "watchlist";
       await refreshState();
       startRefresh();
     } catch (error) {
@@ -1105,12 +1348,23 @@ function bindAuth() {
 }
 
 function bindShell() {
+  document.querySelector(".back-btn")?.addEventListener("click", () => { activeView = "watchlist"; render(); });
   document.querySelectorAll("[data-view]").forEach((btn) => btn.addEventListener("click", () => {
     activeView = btn.dataset.view;
     render();
   }));
   document.getElementById("logoutBtn")?.addEventListener("click", logout);
   document.getElementById("logoutWide")?.addEventListener("click", logout);
+  document.querySelectorAll("[data-contract]").forEach((btn) => btn.addEventListener("click", () => {
+    selectedContractId = btn.dataset.contract;
+    market = quoteFor(selectedContractId);
+    activeView = "trade";
+    render();
+  }));
+  document.getElementById("contractSearch")?.addEventListener("input", (event) => {
+    const query = event.target.value.trim().toLowerCase();
+    document.querySelectorAll("[data-contract]").forEach((item) => { item.hidden = !item.textContent.toLowerCase().includes(query); });
+  });
   document.querySelectorAll("[data-side]").forEach((btn) => btn.addEventListener("click", () => {
     activeSide = btn.dataset.side;
     render();
@@ -1121,11 +1375,15 @@ function bindShell() {
   });
   document.getElementById("orderForm")?.addEventListener("submit", placeOrder);
   document.querySelectorAll("[data-cancel]").forEach((btn) => btn.addEventListener("click", () => cancelOrder(btn.dataset.cancel)));
+  document.querySelectorAll("[data-manual-fill]").forEach((form) => form.addEventListener("submit", manualFillOrder));
+  document.querySelectorAll("[data-edit-fill-price]").forEach((form) => form.addEventListener("submit", editOrderFillPrice));
   document.getElementById("userForm")?.addEventListener("submit", createUser);
+  document.getElementById("contractForm")?.addEventListener("submit", createContract);
+  document.querySelectorAll("[data-contract-toggle]").forEach((btn) => btn.addEventListener("click", () => toggleContract(btn.dataset.contractToggle)));
   document.querySelectorAll("[data-toggle]").forEach((btn) => btn.addEventListener("click", () => toggleUser(btn.dataset.toggle)));
   document.querySelectorAll("[data-remove]").forEach((btn) => btn.addEventListener("click", () => removeUser(btn.dataset.remove)));
   document.querySelectorAll("[data-funds]").forEach((btn) => btn.addEventListener("click", () => applyFunds(btn.dataset.funds)));
-  document.getElementById("settingsForm")?.addEventListener("submit", saveSettings);
+  document.querySelectorAll("[data-rules-form]").forEach((form) => form.addEventListener("submit", saveTraderRules));
 }
 
 function logout() {
@@ -1140,14 +1398,14 @@ async function placeOrder(event) {
   event.preventDefault();
   const type = document.getElementById("orderType").value;
   const qty = Math.floor(Number(document.getElementById("orderQty").value));
-  const price = Number(document.getElementById("orderPrice").value);
+  const price = Number(document.getElementById("orderPrice")?.value || 0);
   if (!qty || qty < 1) return notify("Enter at least 1 lot.");
   if (type === "LIMIT" && !price) return notify("Enter a valid limit price.");
 
   try {
     await api("/api/orders", {
       method: "POST",
-      body: JSON.stringify({ side: activeSide, type, qty, price })
+      body: JSON.stringify({ contractId: selectedContractId, side: activeSide, type, qty, price })
     });
     activeView = "orders";
     await refreshState();
@@ -1167,19 +1425,82 @@ async function cancelOrder(orderId) {
   }
 }
 
+async function manualFillOrder(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const price = Number(form.elements.price.value);
+  try {
+    await api(`/api/orders/${encodeURIComponent(form.dataset.manualFill)}/fill`, { method: "POST", body: JSON.stringify({ price }) });
+    await refreshState();
+    notify("Limit order filled.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function editOrderFillPrice(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const price = Number(form.elements.price.value);
+  try {
+    await api(`/api/orders/${encodeURIComponent(form.dataset.editFillPrice)}/fill-price`, { method: "PATCH", body: JSON.stringify({ price }) });
+    await refreshState();
+    notify("Filled price updated.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
 async function createUser(event) {
   event.preventDefault();
   const id = document.getElementById("newUserId").value.trim().toUpperCase();
   const pin = document.getElementById("newUserPin").value.trim();
   const name = document.getElementById("newUserName").value.trim() || id;
   const funds = Number(document.getElementById("newUserFunds").value);
+  const brokeragePerLot = Number(document.getElementById("newUserBrokerage").value);
+  const marginPerLot = Number(document.getElementById("newUserMargin").value);
+  const allowMarketOrders = document.getElementById("newUserMarketOrders").checked;
+  const allowLimitOrders = document.getElementById("newUserLimitOrders").checked;
   try {
     await api("/api/users", {
       method: "POST",
-      body: JSON.stringify({ id, pin, name, funds })
+      body: JSON.stringify({ id, pin, name, funds, brokeragePerLot, marginPerLot, allowMarketOrders, allowLimitOrders })
     });
     await refreshState();
     notify("User created.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function createContract(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const body = {
+    name: form.elements.namedItem("name").value.trim(),
+    subtitle: form.elements.namedItem("subtitle").value.trim(),
+    instrumentKey: form.elements.namedItem("instrumentKey").value.trim(),
+    lotSize: Number(form.elements.namedItem("lotSize").value),
+    tickSize: Number(form.elements.namedItem("tickSize").value),
+    initialPrice: Number(form.elements.namedItem("initialPrice").value),
+    previousClose: Number(form.elements.namedItem("previousClose").value)
+  };
+  try {
+    await api("/api/contracts", { method: "POST", body: JSON.stringify(body) });
+    await refreshState();
+    notify("Contract added to the watchlist.");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function toggleContract(id) {
+  const contract = state.contracts.find((item) => item.id === id);
+  if (!contract) return;
+  try {
+    await api(`/api/contracts/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ active: !contract.active }) });
+    await refreshState();
+    notify(contract.active ? "Contract hidden." : "Contract visible.");
   } catch (error) {
     notify(error.message);
   }
@@ -1225,17 +1546,22 @@ async function applyFunds(id) {
   }
 }
 
-async function saveSettings(event) {
+async function saveTraderRules(event) {
   event.preventDefault();
-  const brokeragePerLot = Number(document.getElementById("brokeragePerLot").value);
-  const marginPerLot = Number(document.getElementById("marginPerLot").value);
+  const form = event.currentTarget;
+  const id = form.dataset.rulesForm;
+  const brokeragePerLot = Number(form.elements.brokeragePerLot.value);
+  const marginPerLot = Number(form.elements.marginPerLot.value);
+  const allowMarketOrders = form.elements.allowMarketOrders.checked;
+  const allowLimitOrders = form.elements.allowLimitOrders.checked;
+  if (!Number.isFinite(brokeragePerLot) || brokeragePerLot < 0 || !Number.isFinite(marginPerLot) || marginPerLot < 0) return notify("Enter valid charges.");
   try {
-    await api("/api/settings", {
+    await api(`/api/users/${encodeURIComponent(id)}`, {
       method: "PATCH",
-      body: JSON.stringify({ brokeragePerLot, marginPerLot })
+      body: JSON.stringify({ brokeragePerLot, marginPerLot, allowMarketOrders, allowLimitOrders })
     });
     await refreshState();
-    notify("Trading rules saved.");
+    notify(`Settings saved for ${id}.`);
   } catch (error) {
     notify(error.message);
   }

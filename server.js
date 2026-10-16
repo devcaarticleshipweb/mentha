@@ -52,6 +52,8 @@ const demoMarket = {
 };
 
 let market = { ...demoMarket };
+const markets = new Map();
+let contractsCache = [];
 let lastMarketError = null;
 let cachedSettings = { brokeragePerLot: 0, marginPerLot: 0 };
 
@@ -85,8 +87,42 @@ function publicUser(row) {
     id: row.id,
     name: row.name,
     funds: Number(row.funds || 0),
+    brokeragePerLot: Number(row.brokerage_per_lot || 0),
+    marginPerLot: Number(row.margin_per_lot || 0),
+    allowMarketOrders: row.allow_market_orders !== false,
+    allowLimitOrders: row.allow_limit_orders !== false,
     active: Boolean(row.active),
     createdAt: row.created_at
+  };
+}
+
+function publicContract(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    subtitle: row.subtitle,
+    instrumentKey: row.instrument_key,
+    lotSize: Number(row.lot_size),
+    tickSize: Number(row.tick_size),
+    initialPrice: Number(row.initial_price),
+    previousClose: Number(row.previous_close),
+    active: Boolean(row.active)
+  };
+}
+
+function quoteFor(contract) {
+  if (contract.id === "MENTHAOIL-OCT26") return markets.get(contract.id) || market;
+  if (markets.has(contract.id)) return markets.get(contract.id);
+  const ltp = Number(contract.initial_price);
+  const prevClose = Number(contract.previous_close);
+  const tick = Number(contract.tick_size);
+  return {
+    ...demoMarket, ltp, prevClose, open: ltp, high: ltp, low: ltp,
+    avgPrice: ltp, netChange: ltp - prevClose,
+    changePercent: prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0,
+    bids: demoMarket.bids.map(([, qty, count], index) => [ltp - tick * (index + 1), qty, count || 1]),
+    asks: demoMarket.asks.map(([, qty, count], index) => [ltp + tick * (index + 1), qty, count || 1]),
+    source: "demo", instrumentKey: contract.instrumentKey
   };
 }
 
@@ -94,6 +130,7 @@ function publicOrder(row) {
   return {
     id: row.id,
     userId: row.user_id,
+    contractId: row.contract_id,
     side: row.side,
     type: row.type,
     qty: Number(row.qty),
@@ -111,6 +148,7 @@ function publicTrade(row) {
     id: row.id,
     orderId: row.order_id,
     userId: row.user_id,
+    contractId: row.contract_id,
     side: row.side,
     qty: Number(row.qty),
     price: Number(row.price),
@@ -156,15 +194,30 @@ function requireMaster(req, res, next) {
   next();
 }
 
-function roundTick(value) {
-  return Math.round(Number(value) / 0.1) * 0.1;
+function roundTick(value, tick = 0.1) {
+  return Math.round(Number(value) / tick) * tick;
 }
 
-function executablePrice(order) {
-  if (order.type === "MARKET") return order.side === "BUY" ? market.asks[0][0] : market.bids[0][0];
-  if (order.side === "BUY" && market.ltp <= Number(order.price)) return Number(order.price);
-  if (order.side === "SELL" && market.ltp >= Number(order.price)) return Number(order.price);
+function validFillPrice(value) {
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0 || price > 9999999999.99) return null;
+  return Math.round(price * 100) / 100 || null;
+}
+
+function executablePrice(order, quote) {
+  if (order.type === "MARKET") return order.side === "BUY" ? quote.asks[0][0] : quote.bids[0][0];
+  if (order.side === "BUY" && quote.ltp <= Number(order.price)) return Number(order.price);
+  if (order.side === "SELL" && quote.ltp >= Number(order.price)) return Number(order.price);
   return null;
+}
+
+async function loadContracts() {
+  contractsCache = (await db(supabase.from("contracts").select("*").order("created_at", { ascending: true }))).map((row) => {
+    const contract = publicContract(row);
+    if (contract.id === "MENTHAOIL-OCT26") contract.instrumentKey = UPSTOX_INSTRUMENT_KEY;
+    return contract;
+  });
+  return contractsCache;
 }
 
 async function ensureSettings() {
@@ -178,7 +231,7 @@ async function ensureSettings() {
   return cachedSettings;
 }
 
-function calculatePosition(trades) {
+function calculatePosition(trades, lotSize = 360) {
   let qty = 0;
   let avg = 0;
   let realized = 0;
@@ -198,7 +251,7 @@ function calculatePosition(trades) {
 
     const closingQty = Math.min(Math.abs(qty), Math.abs(signedQty));
     const pnlPerUnit = qty > 0 ? tradePrice - avg : avg - tradePrice;
-    realized += pnlPerUnit * closingQty * 360;
+    realized += pnlPerUnit * closingQty * lotSize;
     qty += signedQty;
 
     if (qty === 0) avg = 0;
@@ -208,39 +261,47 @@ function calculatePosition(trades) {
   return { qty, avg, realized: realized - brokerage, brokerage };
 }
 
-async function marginSnapshot(userId, settings) {
-  const [user, trades, openOrders] = await Promise.all([
+async function marginSnapshot(userId) {
+  const [user, trades, openOrders, contracts] = await Promise.all([
     db(supabase.from("app_users").select("*").eq("id", userId).single()),
     db(supabase.from("trades").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(500)),
-    db(supabase.from("orders").select("*").eq("user_id", userId).eq("status", "OPEN").limit(500))
+    db(supabase.from("orders").select("*").eq("user_id", userId).eq("status", "OPEN").limit(500)),
+    contractsCache.length ? Promise.resolve(contractsCache) : loadContracts()
   ]);
-  const pos = calculatePosition(trades);
+  const positions = contracts.map((contract) => calculatePosition(trades.filter((trade) => trade.contract_id === contract.id), contract.lotSize));
+  const pos = { realized: positions.reduce((sum, position) => sum + position.realized, 0) };
   const openLots = openOrders.reduce((sum, order) => sum + Number(order.qty || 0), 0);
-  const usedMargin = (Math.abs(pos.qty) + openLots) * settings.marginPerLot;
+  const heldLots = positions.reduce((sum, position) => sum + Math.abs(position.qty), 0);
+  const usedMargin = (heldLots + openLots) * Number(user.margin_per_lot || 0);
   const available = Number(user.funds || 0) + pos.realized - usedMargin;
   return { user, pos, openLots, usedMargin, available };
 }
 
-async function fillOrder(order) {
-  const settings = await ensureSettings();
-  const fillPrice = executablePrice(order);
+async function fillOrder(order, forcedPrice = null) {
+  const contract = contractsCache.find((item) => item.id === order.contract_id);
+  if (!contract && forcedPrice === null) return order;
+  const fillPrice = forcedPrice ?? executablePrice(order, quoteFor(contract));
   if (!fillPrice) return order;
-  const brokerage = Number(settings.brokeragePerLot || 0) * Number(order.qty || 0);
+  const user = await db(supabase.from("app_users").select("brokerage_per_lot").eq("id", order.user_id).single());
+  const brokerage = Number(user.brokerage_per_lot || 0) * Number(order.qty || 0);
   const now = new Date().toISOString();
-  await db(supabase.from("orders").update({
+  const updated = await db(supabase.from("orders").update({
     status: "FILLED",
     fill_price: fillPrice,
     filled_at: now
-  }).eq("id", order.id));
+  }).eq("id", order.id).eq("status", "OPEN").select().maybeSingle());
+  if (!updated) return null;
   await db(supabase.from("trades").insert({
     order_id: order.id,
     user_id: order.user_id,
+    contract_id: order.contract_id,
     side: order.side,
     qty: order.qty,
     price: fillPrice,
-    brokerage
+    brokerage,
+    created_at: now
   }));
-  return { ...order, status: "FILLED", fill_price: fillPrice, filled_at: now };
+  return updated;
 }
 
 async function matchOpenOrders() {
@@ -265,23 +326,23 @@ function firstNumber(...values) {
   return null;
 }
 
-function parseUpstoxQuote(raw) {
-  const first = Object.values(raw?.data || {})[0];
+function parseUpstoxQuote(first, contract) {
   if (!first) throw new Error("No quote returned by Upstox.");
+  const fallback = quoteFor(contract);
   const bids = normalizeDepth(first.depth?.buy);
   const asks = normalizeDepth(first.depth?.sell);
   const feed = first.eFeedDetails || first.extended_feed_details || {};
   const ltpc = first.ltpc || {};
-  const ltp = firstNumber(first.last_price, first.ltp, ltpc.ltp, demoMarket.ltp);
-  const prevClose = firstNumber(first.cp, first.close_price, first.previous_close, first.ohlc?.close, ltpc.cp, demoMarket.prevClose);
+  const ltp = firstNumber(first.last_price, first.ltp, ltpc.ltp, fallback.ltp);
+  const prevClose = firstNumber(first.prev_close_price, first.cp, first.close_price, first.previous_close, ltpc.cp, first.ohlc?.close, fallback.prevClose);
   const netChange = firstNumber(first.net_change, first.change, first.absolute_change, ltp - prevClose);
   const changePercent = firstNumber(first.change_percent, first.percent_change, first.pchange, prevClose ? (netChange / prevClose) * 100 : 0);
   const oi = firstNumber(first.oi, first.open_interest, feed.oi, 0);
   const previousOi = firstNumber(first.previous_oi, first.prev_oi, feed.poi, feed.previous_oi, 0);
   const oiChange = firstNumber(first.oi_change, first.oi_chg, first.oi_change_value, feed.oi_chg, feed.oichange, previousOi ? oi - previousOi : 0);
-  const open = firstNumber(first.ohlc?.open, first.open, demoMarket.open);
-  const high = firstNumber(first.ohlc?.high, first.high, demoMarket.high);
-  const low = firstNumber(first.ohlc?.low, first.low, demoMarket.low);
+  const open = firstNumber(first.ohlc?.open, first.open, fallback.open);
+  const high = firstNumber(first.ohlc?.high, first.high, fallback.high);
+  const low = firstNumber(first.ohlc?.low, first.low, fallback.low);
   return {
     ltp,
     prevClose,
@@ -290,11 +351,11 @@ function parseUpstoxQuote(raw) {
     open,
     high,
     low,
-    lowerCircuit: firstNumber(first.lower_circuit_limit, first.lower_circuit, first.lc, feed.lc, feed.lower_circuit_limit, demoMarket.lowerCircuit),
-    upperCircuit: firstNumber(first.upper_circuit_limit, first.upper_circuit, first.uc, feed.uc, feed.upper_circuit_limit, demoMarket.upperCircuit),
+    lowerCircuit: firstNumber(first.lower_circuit_limit, first.lower_circuit, first.lc, feed.lc, feed.lower_circuit_limit, fallback.lowerCircuit),
+    upperCircuit: firstNumber(first.upper_circuit_limit, first.upper_circuit, first.uc, feed.uc, feed.upper_circuit_limit, fallback.upperCircuit),
     volume: firstNumber(first.volume, first.vtt, feed.vtt, 0),
     avgPrice: firstNumber(first.average_price, first.avg_price, first.average_traded_price, first.atp, feed.atp, (open + high + low + ltp) / 4),
-    ltq: firstNumber(first.ltq, first.last_quantity, first.last_traded_quantity, ltpc.ltq, 0),
+    ltq: firstNumber(first.ltq, first.last_quantity, first.last_traded_quantity, ltpc.ltq, feed.ltq, 0),
     totalBuyQty: firstNumber(first.total_buy_quantity, first.tbq, 0),
     totalSellQty: firstNumber(first.total_sell_quantity, first.tsq, 0),
     oi,
@@ -302,28 +363,37 @@ function parseUpstoxQuote(raw) {
     oiChange,
     oiDayHigh: firstNumber(first.oi_day_high, feed.oi_day_high, 0),
     oiDayLow: firstNumber(first.oi_day_low, feed.oi_day_low, 0),
-    bids: bids.length ? bids : demoMarket.bids,
-    asks: asks.length ? asks : demoMarket.asks,
+    bids: bids.length ? bids : fallback.bids,
+    asks: asks.length ? asks : fallback.asks,
     source: "upstox",
-    instrumentKey: UPSTOX_INSTRUMENT_KEY,
+    instrumentKey: contract.instrumentKey,
     lastTradeTime: Number(first.last_trade_time ?? first.ltt ?? 0),
     timestamp: first.timestamp || first.last_trade_time || new Date().toISOString()
   };
 }
 
 async function updateMarket() {
+  const contracts = await loadContracts();
   if (!UPSTOX_ACCESS_TOKEN) {
-    market = {
-      ...market,
-      ltp: roundTick(market.ltp + (Math.random() - 0.48) * 1.4),
-      source: "demo"
-    };
+    for (const contract of contracts) {
+      const current = quoteFor(contract);
+      const ltp = Math.max(Number(contract.tickSize), roundTick(current.ltp + (Math.random() - 0.48) * Number(contract.tickSize) * 14, Number(contract.tickSize)));
+      const next = { ...current, ltp, netChange: ltp - current.prevClose,
+        changePercent: current.prevClose ? ((ltp - current.prevClose) / current.prevClose) * 100 : 0,
+        bids: current.bids.map(([, qty, count], index) => [roundTick(ltp - (index + 1) * contract.tickSize, contract.tickSize), qty, count]),
+        asks: current.asks.map(([, qty, count], index) => [roundTick(ltp + (index + 1) * contract.tickSize, contract.tickSize), qty, count]),
+        source: "demo" };
+      markets.set(contract.id, next);
+      if (contract.id === "MENTHAOIL-OCT26") market = next;
+    }
     await matchOpenOrders();
     return;
   }
 
   try {
-    const url = `https://api.upstox.com/v2/market-quote/quotes?instrument_key=${encodeURIComponent(UPSTOX_INSTRUMENT_KEY)}`;
+    const keys = contracts.map((contract) => contract.instrumentKey);
+    if (!keys.length) return;
+    const url = `https://api.upstox.com/v3/market-quote/quotes?instrument_key=${encodeURIComponent(keys.join(","))}`;
     const response = await fetch(url, {
       headers: {
         Accept: "application/json",
@@ -331,7 +401,14 @@ async function updateMarket() {
       }
     });
     if (!response.ok) throw new Error(`Upstox HTTP ${response.status}`);
-    market = parseUpstoxQuote(await response.json());
+    const data = (await response.json()).data || {};
+    for (const contract of contracts) {
+      const quote = Object.values(data).find((item) => item.instrument_token === contract.instrumentKey);
+      if (!quote) continue;
+      const next = parseUpstoxQuote(quote, contract);
+      markets.set(contract.id, next);
+      if (contract.id === "MENTHAOIL-OCT26") market = next;
+    }
     lastMarketError = null;
     await matchOpenOrders();
   } catch (error) {
@@ -343,7 +420,7 @@ setInterval(() => {
   updateMarket().catch((error) => {
     lastMarketError = error.message;
   });
-}, POLL_MS);
+}, Math.max(POLL_MS, 5000));
 updateMarket().catch(() => {});
 ensureSettings().catch(() => {});
 
@@ -374,6 +451,7 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/state", requireAuth, async (req, res) => {
   try {
     const settings = await ensureSettings();
+    const contracts = await loadContracts();
     if (req.session.role === "master") {
       const [users, orders, trades, ledger] = await Promise.all([
         db(supabase.from("app_users").select("*").order("created_at", { ascending: false })),
@@ -388,6 +466,7 @@ app.get("/api/state", requireAuth, async (req, res) => {
         orders: orders.map(publicOrder),
         trades: trades.map(publicTrade),
         ledger: ledger.map(publicLedger),
+        contracts,
         settings
       });
     }
@@ -405,6 +484,7 @@ app.get("/api/state", requireAuth, async (req, res) => {
       orders: orders.map(publicOrder),
       trades: trades.map(publicTrade),
       ledger: ledger.map(publicLedger),
+      contracts,
       settings
     });
   } catch (error) {
@@ -414,6 +494,50 @@ app.get("/api/state", requireAuth, async (req, res) => {
 
 app.get("/api/market", requireAuth, (req, res) => {
   res.json({ ...market, error: lastMarketError });
+});
+
+app.get("/api/markets", requireAuth, async (req, res) => {
+  try {
+    const contracts = contractsCache.length ? contractsCache : await loadContracts();
+    res.json({ markets: Object.fromEntries(contracts.map((contract) => [contract.id, quoteFor(contract)])), error: lastMarketError });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/contracts", requireAuth, requireMaster, async (req, res) => {
+  try {
+    const name = String(req.body.name || "").trim().toUpperCase();
+    const subtitle = String(req.body.subtitle || "").trim().toUpperCase();
+    const instrumentKey = String(req.body.instrumentKey || "").trim();
+    const lotSize = Number(req.body.lotSize);
+    const tickSize = Number(req.body.tickSize);
+    const initialPrice = Number(req.body.initialPrice);
+    const previousClose = Number(req.body.previousClose);
+    if (!name || name.length > 50 || !subtitle || subtitle.length > 60) return res.status(400).json({ error: "Enter a contract name and exchange/expiry." });
+    if (!instrumentKey || instrumentKey.length > 150) return res.status(400).json({ error: "Enter a valid Upstox instrument key." });
+    if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.01 || Math.abs(tickSize * 100 - Math.round(tickSize * 100)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) return res.status(400).json({ error: "Enter valid lot size, tick size and prices." });
+    const row = await db(supabase.from("contracts").insert({
+      id: crypto.randomUUID(), name, subtitle, instrument_key: instrumentKey,
+      lot_size: lotSize, tick_size: tickSize, initial_price: initialPrice,
+      previous_close: previousClose, active: true
+    }).select().single());
+    await loadContracts();
+    res.status(201).json({ contract: publicContract(row) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/contracts/:id", requireAuth, requireMaster, async (req, res) => {
+  try {
+    if (typeof req.body.active !== "boolean") return res.status(400).json({ error: "Active status required." });
+    const row = await db(supabase.from("contracts").update({ active: req.body.active }).eq("id", req.params.id).select().single());
+    await loadContracts();
+    res.json({ contract: publicContract(row) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.patch("/api/settings", requireAuth, requireMaster, async (req, res) => {
@@ -441,9 +565,16 @@ app.post("/api/users", requireAuth, requireMaster, async (req, res) => {
     const pin = String(req.body.pin || "").trim();
     const name = String(req.body.name || id).trim();
     const funds = Number(req.body.funds || 0);
+    const brokeragePerLot = Number(req.body.brokeragePerLot ?? 0);
+    const marginPerLot = Number(req.body.marginPerLot ?? 0);
+    const allowMarketOrders = req.body.allowMarketOrders ?? true;
+    const allowLimitOrders = req.body.allowLimitOrders ?? true;
     if (!/^[A-Z0-9_-]{3,20}$/.test(id)) return res.status(400).json({ error: "Use 3-20 letters, numbers, _ or - for user ID." });
     if (!pin || pin.length < 4) return res.status(400).json({ error: "PIN must be at least 4 digits." });
     if (!Number.isFinite(funds) || funds < 0) return res.status(400).json({ error: "Opening funds must be valid." });
+    if (!Number.isFinite(brokeragePerLot) || brokeragePerLot < 0) return res.status(400).json({ error: "Brokerage per lot must be zero or more." });
+    if (!Number.isFinite(marginPerLot) || marginPerLot < 0) return res.status(400).json({ error: "Margin per lot must be zero or more." });
+    if (typeof allowMarketOrders !== "boolean" || typeof allowLimitOrders !== "boolean") return res.status(400).json({ error: "Order permissions must be true or false." });
     if (id === "MASTER") return res.status(400).json({ error: "That user ID is reserved." });
 
     const salt = crypto.randomBytes(16).toString("hex");
@@ -451,6 +582,10 @@ app.post("/api/users", requireAuth, requireMaster, async (req, res) => {
       id,
       name,
       funds,
+      brokerage_per_lot: brokeragePerLot,
+      margin_per_lot: marginPerLot,
+      allow_market_orders: allowMarketOrders,
+      allow_limit_orders: allowLimitOrders,
       pin_salt: salt,
       pin_hash: hashPin(pin, salt),
       active: true
@@ -473,6 +608,22 @@ app.patch("/api/users/:id", requireAuth, requireMaster, async (req, res) => {
     const updates = {};
     if (typeof req.body.active === "boolean") updates.active = req.body.active;
     if (req.body.name) updates.name = String(req.body.name).trim();
+    if (req.body.brokeragePerLot !== undefined) {
+      updates.brokerage_per_lot = Number(req.body.brokeragePerLot);
+      if (!Number.isFinite(updates.brokerage_per_lot) || updates.brokerage_per_lot < 0) return res.status(400).json({ error: "Brokerage per lot must be zero or more." });
+    }
+    if (req.body.marginPerLot !== undefined) {
+      updates.margin_per_lot = Number(req.body.marginPerLot);
+      if (!Number.isFinite(updates.margin_per_lot) || updates.margin_per_lot < 0) return res.status(400).json({ error: "Margin per lot must be zero or more." });
+    }
+    if (req.body.allowMarketOrders !== undefined) {
+      if (typeof req.body.allowMarketOrders !== "boolean") return res.status(400).json({ error: "Market order permission must be true or false." });
+      updates.allow_market_orders = req.body.allowMarketOrders;
+    }
+    if (req.body.allowLimitOrders !== undefined) {
+      if (typeof req.body.allowLimitOrders !== "boolean") return res.status(400).json({ error: "Limit order permission must be true or false." });
+      updates.allow_limit_orders = req.body.allowLimitOrders;
+    }
     const user = await db(supabase.from("app_users").update(updates).eq("id", id).select().single());
     res.json({ user: publicUser(user) });
   } catch (error) {
@@ -514,19 +665,23 @@ app.post("/api/orders", requireAuth, async (req, res) => {
   try {
     if (req.session.role !== "user") return res.status(403).json({ error: "Login as a trader to place orders." });
     const side = String(req.body.side || "").toUpperCase();
+    const contractId = String(req.body.contractId || "MENTHAOIL-OCT26");
+    const contract = (contractsCache.length ? contractsCache : await loadContracts()).find((item) => item.id === contractId && item.active);
+    if (!contract) return res.status(400).json({ error: "Contract is not available." });
     const type = String(req.body.type || "").toUpperCase();
     const qty = Math.floor(Number(req.body.qty || 0));
-    const price = req.body.price === null || req.body.price === undefined ? null : roundTick(req.body.price);
+    const price = req.body.price === null || req.body.price === undefined ? null : roundTick(req.body.price, contract.tickSize);
     if (!["BUY", "SELL"].includes(side)) return res.status(400).json({ error: "Invalid side." });
     if (!["MARKET", "LIMIT"].includes(type)) return res.status(400).json({ error: "Invalid order type." });
     if (!qty || qty < 1) return res.status(400).json({ error: "Enter at least 1 lot." });
     if (type === "LIMIT" && !price) return res.status(400).json({ error: "Enter a valid limit price." });
 
-    const settings = await ensureSettings();
-    const margin = await marginSnapshot(req.session.id, settings);
+    const margin = await marginSnapshot(req.session.id);
     if (!margin.user.active) return res.status(403).json({ error: "User is blocked." });
-    const requiredMargin = settings.marginPerLot * qty;
-    const estimatedBrokerage = settings.brokeragePerLot * qty;
+    if (type === "MARKET" && !margin.user.allow_market_orders) return res.status(403).json({ error: "Market orders are disabled for this trader." });
+    if (type === "LIMIT" && !margin.user.allow_limit_orders) return res.status(403).json({ error: "Limit orders are disabled for this trader." });
+    const requiredMargin = Number(margin.user.margin_per_lot || 0) * qty;
+    const estimatedBrokerage = Number(margin.user.brokerage_per_lot || 0) * qty;
     if (margin.available < requiredMargin + estimatedBrokerage) {
       return res.status(400).json({
         error: `Insufficient funds. Required margin plus brokerage is ${requiredMargin + estimatedBrokerage}, available is ${Math.max(0, margin.available).toFixed(2)}.`
@@ -535,14 +690,48 @@ app.post("/api/orders", requireAuth, async (req, res) => {
 
     const order = await db(supabase.from("orders").insert({
       user_id: req.session.id,
+      contract_id: contractId,
       side,
       type,
       qty,
       price: type === "MARKET" ? null : price,
       status: "OPEN"
     }).select().single());
-    const finalOrder = await fillOrder(order);
+    const finalOrder = await fillOrder(order) || await db(supabase.from("orders").select("*").eq("id", order.id).single());
     res.status(201).json({ order: publicOrder(finalOrder) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post("/api/orders/:id/fill", requireAuth, requireMaster, async (req, res) => {
+  try {
+    const price = validFillPrice(req.body.price);
+    if (price === null) return res.status(400).json({ error: "Enter a valid fill price above zero." });
+    const id = String(req.params.id || "");
+    const order = await db(supabase.from("orders").select("*").eq("id", id).single());
+    if (order.type !== "LIMIT" || order.status !== "OPEN") return res.status(409).json({ error: "Only pending limit orders can be filled manually." });
+    const filled = await fillOrder(order, price);
+    if (!filled) return res.status(409).json({ error: "This order is no longer pending." });
+    res.json({ order: publicOrder(filled) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.patch("/api/orders/:id/fill-price", requireAuth, requireMaster, async (req, res) => {
+  try {
+    const price = validFillPrice(req.body.price);
+    if (price === null) return res.status(400).json({ error: "Enter a valid fill price above zero." });
+    const id = String(req.params.id || "");
+    const order = await db(supabase.from("orders").select("*").eq("id", id).single());
+    if (order.status !== "FILLED") return res.status(409).json({ error: "Only filled orders can have their fill price changed." });
+    const trade = await db(supabase.from("trades").select("id").eq("order_id", id).maybeSingle());
+    if (!trade) return res.status(409).json({ error: "The trade for this order is missing." });
+    const updated = await db(supabase.from("orders").update({ fill_price: price }).eq("id", id).eq("status", "FILLED").select().maybeSingle());
+    if (!updated) return res.status(409).json({ error: "This order is no longer filled." });
+    await db(supabase.from("trades").update({ price }).eq("order_id", id));
+    res.json({ order: publicOrder(updated) });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
