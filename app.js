@@ -60,6 +60,8 @@ function localStore() {
   try {
     const db = JSON.parse(localStorage.getItem("mentha-local-db") || "null") || structuredClone(seedState);
     db.contracts ||= structuredClone(seedState.contracts);
+    const menthaContract = db.contracts.find((contract) => contract.id === DEFAULT_CONTRACT_ID);
+    if (menthaContract) menthaContract.lotSize = SCRIP.lotSize;
     for (const order of db.orders) order.contractId ||= DEFAULT_CONTRACT_ID;
     for (const trade of db.trades) trade.contractId ||= DEFAULT_CONTRACT_ID;
     for (const user of db.users) {
@@ -75,7 +77,8 @@ function localStore() {
 }
 
 function contractFor(id = selectedContractId) {
-  return state.contracts.find((contract) => contract.id === id) || defaultContract;
+  const contract = state.contracts.find((item) => item.id === id) || defaultContract;
+  return id === DEFAULT_CONTRACT_ID ? { ...contract, lotSize: SCRIP.lotSize } : contract;
 }
 
 function initialQuote(contract) {
@@ -497,7 +500,7 @@ function isMaster() {
 }
 
 function tradeMultiplier(contractId = selectedContractId) {
-  return Number(contractFor(contractId).lotSize || SCRIP.lotSize);
+  return Number(contractFor(contractId).lotSize);
 }
 
 function userOrders(userId, includeAll = false) {
@@ -862,6 +865,7 @@ function navButton(view, icon, label) {
 
 function marketTemplate(pulse = false) {
   const { change, pct } = marketMove();
+  const isShark = contractFor().instrumentKey?.startsWith("SHARK:");
   const lower = finiteNumber(market.lowerCircuit, market.prevClose * 0.96);
   const upper = finiteNumber(market.upperCircuit, market.prevClose * 1.04);
   const circuitRange = upper - lower;
@@ -870,10 +874,10 @@ function marketTemplate(pulse = false) {
     ["Volume", whole(market.volume)],
     ["Avg. traded price", fmt(market.avgPrice, 2)],
     ["Last traded time", formatTradeTime(market.lastTradeTime || market.timestamp || market.lastTick)],
-    ["Last traded quantity", whole(market.ltq)],
+    ["Last traded quantity", isShark ? fmt(market.ltq, 6) : whole(market.ltq)],
     ["Spot", fmt(market.ltp, 2)],
-    ["Last trading date", "30 Oct 26"],
-    ["Expiry", "30 Oct 26"],
+    ["Last trading date", isShark ? "Perpetual" : "30 Oct 26"],
+    ["Expiry", isShark ? "Perpetual" : "30 Oct 26"],
     ["OI (chg)", signed(market.oiChange || 0)],
     ["Open Interest", whole(market.oi)]
   ];
@@ -887,16 +891,16 @@ function marketTemplate(pulse = false) {
         <div><span>High</span><strong>${fmt(market.high, 2)}</strong></div>
         <div><span>Low</span><strong>${fmt(market.low, 2)}</strong></div>
         <div class="prev-close-cell">
-          <span>Prev. close</span>
+          <span>${isShark ? "24h reference" : "Prev. close"}</span>
           <strong>${fmt(market.prevClose, 2)}</strong>
           <button class="market-toggle" type="button" data-market-toggle aria-label="${marketDetailsExpanded ? "Hide market details" : "Show market details"}">${marketDetailsExpanded ? "⌃" : "⌄"}</button>
         </div>
       </div>
-      <div class="circuit-block">
+      ${market.instrumentKey?.startsWith("SHARK:") ? "" : `<div class="circuit-block">
         <span>Circuit (Lower-Upper)</span>
         <div class="circuit-line"><i style="left:${circuitPos}%"></i></div>
         <div class="row"><strong>${fmt(lower, 2)}</strong><strong>${fmt(upper, 2)}</strong></div>
-      </div>
+      </div>`}
       <div class="market-detail-list ${marketDetailsExpanded ? "expanded" : ""}">
         ${detailRows.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}
       </div>
@@ -905,11 +909,13 @@ function marketTemplate(pulse = false) {
 }
 
 function depthTemplate() {
+  const isShark = contractFor().instrumentKey?.startsWith("SHARK:");
+  const qty = (value) => isShark ? fmt(value, 6) : whole(value);
   const rows = Array.from({ length: 5 }, (_, index) => ({
     bid: market.bids[index] || [0, 0],
     ask: market.asks[index] || [0, 0]
   }));
-  const maxQty = Math.max(...rows.map((row) => row.bid[1]), ...rows.map((row) => row.ask[1]), 1);
+  const maxQty = Math.max(...rows.map((row) => row.bid[1]), ...rows.map((row) => row.ask[1]), 0.0001);
   const totalBuy = Number(market.totalBuyQty || 0) || market.bids.reduce((sum, [, qty]) => sum + qty, 0);
   const totalSell = Number(market.totalSellQty || 0) || market.asks.reduce((sum, [, qty]) => sum + qty, 0);
   const buyPct = totalBuy + totalSell ? Math.round((totalBuy / (totalBuy + totalSell)) * 100) : 50;
@@ -922,18 +928,18 @@ function depthTemplate() {
           <div class="depth-row" style="--buy-w:${Math.max(10, (bid[1] / maxQty) * 100)}%; --sell-w:${Math.max(10, (ask[1] / maxQty) * 100)}%;">
             <span class="depth-side-bar buy-depth"></span>
             <span class="depth-side-bar sell-depth"></span>
-            <span class="qty-cell">${whole(bid[1])}</span>
-            <span class="order-count">${whole(bid[2] || 0)}</span>
+            <span class="qty-cell">${qty(bid[1])}</span>
+            <span class="order-count">${isShark ? "—" : whole(bid[2] || 0)}</span>
             <strong>${fmt(bid[0], 2)}</strong>
             <strong>${fmt(ask[0], 2)}</strong>
-            <span class="order-count">${whole(ask[2] || 0)}</span>
-            <span class="qty-cell">${whole(ask[1])}</span>
+            <span class="order-count">${isShark ? "—" : whole(ask[2] || 0)}</span>
+            <span class="qty-cell">${qty(ask[1])}</span>
           </div>
         `).join("")}
       </div>
       <div class="depth-total">
-        <div><span>Total buy qty.</span><strong>${buyPct}% (${whole(totalBuy)})</strong></div>
-        <div><span>Total sell qty.</span><strong>(${whole(totalSell)}) ${100 - buyPct}%</strong></div>
+        <div><span>Total buy qty.</span><strong>${buyPct}% (${qty(totalBuy)})</strong></div>
+        <div><span>Total sell qty.</span><strong>(${qty(totalSell)}) ${100 - buyPct}%</strong></div>
       </div>
       <div class="depth-ratio"><span style="width:${buyPct}%"></span><i style="left:${buyPct}%"></i></div>
     </section>
@@ -982,7 +988,7 @@ function tradeTemplate(pos) {
           <label class="field"><span class="label">Order type</span><select id="orderType">${allowMarketOrders ? "<option>MARKET</option>" : ""}${allowLimitOrders ? "<option>LIMIT</option>" : ""}</select></label>
           <label class="field"><span class="label">Lots</span><input id="orderQty" type="number" min="1" step="1" value="${lastQty}"></label>
         </div>
-        ${allowLimitOrders ? `<label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="${contractFor().tickSize}" value="${Number(activeSide === "BUY" ? market.asks[0][0] : market.bids[0][0]).toFixed(2)}"></label>` : ""}
+        ${allowLimitOrders ? `<label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="${contractFor().tickSize}" value="${Number(activeSide === "BUY" ? market.asks[0]?.[0] ?? market.ltp : market.bids[0]?.[0] ?? market.ltp).toFixed(2)}"></label>` : ""}
         <p class="muted">${allowMarketOrders ? "Market buy fills at best ask, market sell fills at best bid. " : ""}${allowLimitOrders ? "Limit orders fill when LTP reaches the limit. " : ""}Brokerage ${whole(brokerage)} per lot.</p>
         <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(contractFor().name)}</button>
       </form>
@@ -1100,13 +1106,13 @@ function contractsAdminTemplate() {
   return `
     <section class="panel">
       <div class="row"><h2>Contracts</h2><button class="danger" id="logoutWide" type="button">Log out</button></div>
-      <p class="muted">Add instruments to every trader's watchlist. Use the exact Upstox instrument key for live quotes.</p>
+      <p class="muted">Add instruments to every trader's watchlist. Use an Upstox instrument key or a Shark pair such as SHARK:BTCINR.</p>
       <form class="trade-form" id="contractForm" style="margin-top:16px">
         <div class="form-grid">
           <label class="field"><span class="label">Contract name</span><input name="name" placeholder="SILVERMIC FUT" required></label>
           <label class="field"><span class="label">Exchange and expiry</span><input name="subtitle" placeholder="MCX 30 NOV 26" required></label>
         </div>
-        <label class="field"><span class="label">Upstox instrument key</span><input name="instrumentKey" placeholder="MCX_FO|..." required></label>
+        <label class="field"><span class="label">Upstox key or Shark pair</span><input name="instrumentKey" placeholder="MCX_FO|... or SHARK:BTCINR" required></label>
         <div class="form-grid">
           <label class="field"><span class="label">Lot size</span><input name="lotSize" type="number" min="1" step="1" value="1" required></label>
           <label class="field"><span class="label">Tick size</span><input name="tickSize" type="number" min="0.01" step="0.01" value="0.1" required></label>

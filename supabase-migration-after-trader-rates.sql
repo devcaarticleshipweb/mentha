@@ -21,7 +21,7 @@ insert into public.contracts
   (id, name, subtitle, instrument_key, lot_size, tick_size, initial_price, previous_close)
 values
   ('MENTHAOIL-OCT26', 'MENTHAOIL FUT', 'MCX 30 OCT 26', 'MCX_FO|552719', 360, 0.1, 927.4, 921.8)
-on conflict (id) do nothing;
+on conflict (id) do update set lot_size = 360;
 
 create table if not exists public.fund_ledger (
   id uuid primary key default gen_random_uuid(),
@@ -78,3 +78,9 @@ create policy "service role manages fund ledger"
   with check (auth.role() = 'service_role');
 
 commit;
+
+-- Tell Supabase's PostgREST API to recognize the newly created table/columns.
+notify pgrst, 'reload schema';
+
+-- The SQL Editor should return "public.contracts" here.
+select to_regclass('public.contracts') as contracts_table;

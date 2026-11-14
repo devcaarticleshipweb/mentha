@@ -15,7 +15,10 @@ This version is ready for Render + Supabase.
 Keep the service role key secret. It goes only in Render environment variables.
 
 If the last schema change you applied was individual margin and brokerage rates, run `supabase-migration-after-trader-rates.sql` in Supabase SQL Editor before starting the updated app. For a fresh project, run the complete `supabase-schema.sql` instead. The migration adds contracts and order permissions, assigns existing orders and trades to the original MENTHAOIL contract, and backfills missing execution details.
+If login reports that `public.contracts` is missing from the schema cache, run the migration in the Supabase project configured by Render's `SUPABASE_URL`. Its final query should return `public.contracts`. The migration also requests a PostgREST schema cache reload.
 The latest schema also adds `fund_ledger`, used for opening balance and fund addition/removal history.
+For an existing deployment, run `supabase-fix-mentha-lot-size.sql` in Supabase SQL Editor to correct the MENTHAOIL contract to 360 kg per lot.
+To add the Shark crypto watchlist to an existing deployment, run `supabase-add-shark-crypto.sql` in the same SQL Editor. A fresh project gets these pairs from `supabase-schema.sql`.
 
 ## 2. Push Project To GitHub
 
@@ -31,6 +34,7 @@ Required deploy files:
 - `app.js`
 - `manifest.webmanifest`
 - `supabase-schema.sql`
+- `supabase-add-shark-crypto.sql` (existing databases)
 
 ## 3. Deploy On Render
 
@@ -67,6 +71,8 @@ your MASTER_PIN
 Create users from the Admin tab. Users can then login from their own phone.
 
 The master-only Contracts tab adds instruments to every trader's Watchlist. Enter the instrument's Upstox key, lot size, tick size, and starting and previous-close prices. The starting prices are used when the Upstox token is unavailable. Traders can open a watchlist row to view its market depth and place paper orders for that contract.
+
+Bitcoin, Ethereum, Solana, and XRP INR perpetual pairs use Shark Exchange's public ticker and depth endpoints. They need no Shark API key. Other supported INR or USDT pairs can be added in Contracts using an instrument key such as `SHARK:BNBINR` or `SHARK:BTCUSDT`. Shark quotes show as unavailable until a valid exchange response arrives; simulated prices are never used to fill Shark orders.
 
 ## 5. Configure Trading Rules
 

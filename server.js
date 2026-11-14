@@ -102,7 +102,7 @@ function publicContract(row) {
     name: row.name,
     subtitle: row.subtitle,
     instrumentKey: row.instrument_key,
-    lotSize: Number(row.lot_size),
+    lotSize: row.id === "MENTHAOIL-OCT26" ? 360 : Number(row.lot_size),
     tickSize: Number(row.tick_size),
     initialPrice: Number(row.initial_price),
     previousClose: Number(row.previous_close),
@@ -113,6 +113,12 @@ function publicContract(row) {
 function quoteFor(contract) {
   if (contract.id === "MENTHAOIL-OCT26") return markets.get(contract.id) || market;
   if (markets.has(contract.id)) return markets.get(contract.id);
+  if (sharkPair(contract)) return {
+    ...demoMarket, ltp: 0, prevClose: 0, open: 0, high: 0, low: 0,
+    avgPrice: 0, netChange: 0, changePercent: 0, volume: 0, ltq: 0,
+    lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
+    bids: [], asks: [], source: "pending", instrumentKey: contract.instrumentKey
+  };
   const ltp = Number(contract.initial_price);
   const prevClose = Number(contract.previous_close);
   const tick = Number(contract.tick_size);
@@ -124,6 +130,50 @@ function quoteFor(contract) {
     asks: demoMarket.asks.map(([, qty, count], index) => [ltp + tick * (index + 1), qty, count || 1]),
     source: "demo", instrumentKey: contract.instrumentKey
   };
+}
+
+function sharkPair(contract) {
+  const match = /^SHARK:([A-Z0-9]+(?:INR|USDT))$/.exec(contract?.instrumentKey || "");
+  return match?.[1] || null;
+}
+
+function parseSharkQuote(ticker, depth, contract) {
+  const pair = sharkPair(contract);
+  if (!ticker || ticker.s !== pair) throw new Error(`No Shark ticker for ${pair}.`);
+  const ltp = Number(ticker.c);
+  const open = Number(ticker.o);
+  if (!Number.isFinite(ltp) || ltp <= 0 || !Number.isFinite(open) || open <= 0) throw new Error(`Invalid Shark price for ${pair}.`);
+  const bids = (depth?.s === pair && Array.isArray(depth.b) ? depth.b : [])
+    .map(([price, qty]) => [Number(price), Number(qty), 0])
+    .filter(([price, qty]) => Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0)
+    .slice(0, 5);
+  const asks = (depth?.s === pair && Array.isArray(depth.a) ? depth.a : [])
+    .map(([price, qty]) => [Number(price), Number(qty), 0])
+    .filter(([price, qty]) => Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0)
+    .slice(0, 5);
+  const netChange = Number(ticker.p);
+  const prevClose = ltp - (Number.isFinite(netChange) ? netChange : ltp - open);
+  return {
+    ltp, prevClose, open, high: Number(ticker.h) || ltp, low: Number(ticker.l) || ltp,
+    netChange: ltp - prevClose, changePercent: prevClose ? (ltp - prevClose) / prevClose * 100 : 0,
+    volume: Number(ticker.v) || 0, ltq: Number(ticker.Q) || 0, avgPrice: Number(ticker.w) || ltp,
+    lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
+    bids, asks, source: "shark", instrumentKey: contract.instrumentKey,
+    timestamp: new Date(Number(ticker.E) || Date.now()).toISOString()
+  };
+}
+
+async function fetchSharkQuote(contract) {
+  const pair = sharkPair(contract);
+  const base = "https://api.sharkexchange.in/v1/market";
+  const [tickerResponse, depthResponse] = await Promise.all([
+    fetch(`${base}/ticker24Hr/${pair}`, { signal: AbortSignal.timeout(8000) }),
+    fetch(`${base}/depth/${pair}`, { signal: AbortSignal.timeout(8000) }).catch(() => null)
+  ]);
+  if (!tickerResponse.ok) throw new Error(`Shark ${pair} HTTP ${tickerResponse.status}`);
+  const ticker = (await tickerResponse.json()).data;
+  const depth = depthResponse?.ok ? (await depthResponse.json().catch(() => null))?.data : null;
+  return parseSharkQuote(ticker, depth, contract);
 }
 
 function publicOrder(row) {
@@ -205,7 +255,7 @@ function validFillPrice(value) {
 }
 
 function executablePrice(order, quote) {
-  if (order.type === "MARKET") return order.side === "BUY" ? quote.asks[0][0] : quote.bids[0][0];
+  if (order.type === "MARKET") return order.side === "BUY" ? quote.asks?.[0]?.[0] ?? null : quote.bids?.[0]?.[0] ?? null;
   if (order.side === "BUY" && quote.ltp <= Number(order.price)) return Number(order.price);
   if (order.side === "SELL" && quote.ltp >= Number(order.price)) return Number(order.price);
   return null;
@@ -280,6 +330,7 @@ async function marginSnapshot(userId) {
 async function fillOrder(order, forcedPrice = null) {
   const contract = contractsCache.find((item) => item.id === order.contract_id);
   if (!contract && forcedPrice === null) return order;
+  if (sharkPair(contract) && quoteFor(contract).source !== "shark" && forcedPrice === null) return order;
   const fillPrice = forcedPrice ?? executablePrice(order, quoteFor(contract));
   if (!fillPrice) return order;
   const user = await db(supabase.from("app_users").select("brokerage_per_lot").eq("id", order.user_id).single());
@@ -374,8 +425,20 @@ function parseUpstoxQuote(first, contract) {
 
 async function updateMarket() {
   const contracts = await loadContracts();
+  const sharkContracts = contracts.filter(sharkPair);
+  const upstoxContracts = contracts.filter((contract) => !sharkPair(contract));
+  const sharkResults = await Promise.allSettled(sharkContracts.map(fetchSharkQuote));
+  const errors = [];
+  sharkResults.forEach((result, index) => {
+    const contract = sharkContracts[index];
+    if (result.status === "fulfilled") markets.set(contract.id, result.value);
+    else {
+      markets.delete(contract.id);
+      errors.push(`${contract.name}: ${result.reason.message}`);
+    }
+  });
   if (!UPSTOX_ACCESS_TOKEN) {
-    for (const contract of contracts) {
+    for (const contract of upstoxContracts) {
       const current = quoteFor(contract);
       const ltp = Math.max(Number(contract.tickSize), roundTick(current.ltp + (Math.random() - 0.48) * Number(contract.tickSize) * 14, Number(contract.tickSize)));
       const next = { ...current, ltp, netChange: ltp - current.prevClose,
@@ -386,13 +449,18 @@ async function updateMarket() {
       markets.set(contract.id, next);
       if (contract.id === "MENTHAOIL-OCT26") market = next;
     }
+    lastMarketError = errors.length ? errors.join("; ") : null;
     await matchOpenOrders();
     return;
   }
 
   try {
-    const keys = contracts.map((contract) => contract.instrumentKey);
-    if (!keys.length) return;
+    const keys = upstoxContracts.map((contract) => contract.instrumentKey);
+    if (!keys.length) {
+      lastMarketError = errors.length ? errors.join("; ") : null;
+      await matchOpenOrders();
+      return;
+    }
     const url = `https://api.upstox.com/v3/market-quote/quotes?instrument_key=${encodeURIComponent(keys.join(","))}`;
     const response = await fetch(url, {
       headers: {
@@ -402,26 +470,38 @@ async function updateMarket() {
     });
     if (!response.ok) throw new Error(`Upstox HTTP ${response.status}`);
     const data = (await response.json()).data || {};
-    for (const contract of contracts) {
+    for (const contract of upstoxContracts) {
       const quote = Object.values(data).find((item) => item.instrument_token === contract.instrumentKey);
       if (!quote) continue;
       const next = parseUpstoxQuote(quote, contract);
       markets.set(contract.id, next);
       if (contract.id === "MENTHAOIL-OCT26") market = next;
     }
-    lastMarketError = null;
+    lastMarketError = errors.length ? errors.join("; ") : null;
     await matchOpenOrders();
   } catch (error) {
-    lastMarketError = error.message;
+    lastMarketError = [...errors, error.message].join("; ");
+    await matchOpenOrders();
+  }
+}
+
+let marketUpdateRunning = false;
+async function runMarketUpdate() {
+  if (marketUpdateRunning) return;
+  marketUpdateRunning = true;
+  try {
+    await updateMarket();
+  } finally {
+    marketUpdateRunning = false;
   }
 }
 
 setInterval(() => {
-  updateMarket().catch((error) => {
+  runMarketUpdate().catch((error) => {
     lastMarketError = error.message;
   });
 }, Math.max(POLL_MS, 5000));
-updateMarket().catch(() => {});
+runMarketUpdate().catch(() => {});
 ensureSettings().catch(() => {});
 
 app.post("/api/login", async (req, res) => {
@@ -515,7 +595,7 @@ app.post("/api/contracts", requireAuth, requireMaster, async (req, res) => {
     const initialPrice = Number(req.body.initialPrice);
     const previousClose = Number(req.body.previousClose);
     if (!name || name.length > 50 || !subtitle || subtitle.length > 60) return res.status(400).json({ error: "Enter a contract name and exchange/expiry." });
-    if (!instrumentKey || instrumentKey.length > 150) return res.status(400).json({ error: "Enter a valid Upstox instrument key." });
+    if (!instrumentKey || instrumentKey.length > 150 || (instrumentKey.startsWith("SHARK:") && !/^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(instrumentKey))) return res.status(400).json({ error: "Enter an Upstox key or Shark pair as SHARK:BTCINR." });
     if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.01 || Math.abs(tickSize * 100 - Math.round(tickSize * 100)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) return res.status(400).json({ error: "Enter valid lot size, tick size and prices." });
     const row = await db(supabase.from("contracts").insert({
       id: crypto.randomUUID(), name, subtitle, instrument_key: instrumentKey,
@@ -675,6 +755,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     if (!["MARKET", "LIMIT"].includes(type)) return res.status(400).json({ error: "Invalid order type." });
     if (!qty || qty < 1) return res.status(400).json({ error: "Enter at least 1 lot." });
     if (type === "LIMIT" && !price) return res.status(400).json({ error: "Enter a valid limit price." });
+    if (sharkPair(contract) && (quoteFor(contract).source !== "shark" || (type === "MARKET" && (!quoteFor(contract).bids.length || !quoteFor(contract).asks.length)))) return res.status(503).json({ error: "Shark price or order book is unavailable for this pair." });
 
     const margin = await marginSnapshot(req.session.id);
     if (!margin.user.active) return res.status(403).json({ error: "User is blocked." });

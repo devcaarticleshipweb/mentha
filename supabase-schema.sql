@@ -25,6 +25,14 @@ create table if not exists public.contracts (
 
 insert into public.contracts (id, name, subtitle, instrument_key, lot_size, tick_size, initial_price, previous_close)
 values ('MENTHAOIL-OCT26', 'MENTHAOIL FUT', 'MCX 30 OCT 26', 'MCX_FO|552719', 360, 0.1, 927.4, 921.8)
+on conflict (id) do update set lot_size = 360;
+
+insert into public.contracts (id, name, subtitle, instrument_key, lot_size, tick_size, initial_price, previous_close)
+values
+  ('SHARK-BTCINR', 'BITCOIN', 'SHARK BTC/INR', 'SHARK:BTCINR', 1, 0.01, 1, 1),
+  ('SHARK-ETHINR', 'ETHEREUM', 'SHARK ETH/INR', 'SHARK:ETHINR', 1, 0.01, 1, 1),
+  ('SHARK-SOLINR', 'SOLANA', 'SHARK SOL/INR', 'SHARK:SOLINR', 1, 0.01, 1, 1),
+  ('SHARK-XRPINR', 'XRP', 'SHARK XRP/INR', 'SHARK:XRPINR', 1, 0.01, 1, 1)
 on conflict (id) do nothing;
 
 create table if not exists public.fund_ledger (
@@ -156,3 +164,5 @@ on public.app_settings
 for all
 using (auth.role() = 'service_role')
 with check (auth.role() = 'service_role');
+
+notify pgrst, 'reload schema';
