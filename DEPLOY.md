@@ -18,7 +18,7 @@ If the last schema change you applied was individual margin and brokerage rates,
 If login reports that `public.contracts` is missing from the schema cache, run the migration in the Supabase project configured by Render's `SUPABASE_URL`. Its final query should return `public.contracts`. The migration also requests a PostgREST schema cache reload.
 The latest schema also adds `fund_ledger`, used for opening balance and fund addition/removal history.
 For an existing deployment, run `supabase-fix-mentha-lot-size.sql` in Supabase SQL Editor to correct the MENTHAOIL contract to 360 kg per lot.
-To add the Shark crypto watchlist to an existing deployment, run `supabase-add-shark-crypto.sql` in the same SQL Editor. A fresh project gets these pairs from `supabase-schema.sql`.
+The backend automatically adds the four default Shark crypto pairs to an existing database on startup. `supabase-add-shark-crypto.sql` remains available if you need to add them manually. A fresh project gets these pairs from `supabase-schema.sql`.
 
 ## 2. Push Project To GitHub
 
@@ -73,6 +73,8 @@ Create users from the Admin tab. Users can then login from their own phone.
 The master-only Contracts tab adds instruments to every trader's Watchlist. Enter the instrument's Upstox key, lot size, tick size, and starting and previous-close prices. The starting prices are used when the Upstox token is unavailable. Traders can open a watchlist row to view its market depth and place paper orders for that contract.
 
 Bitcoin, Ethereum, Solana, and XRP INR perpetual pairs use Shark Exchange's public ticker and depth endpoints. They need no Shark API key. Other supported INR or USDT pairs can be added in Contracts using an instrument key such as `SHARK:BNBINR` or `SHARK:BTCUSDT`. Shark quotes show as unavailable until a valid exchange response arrives; simulated prices are never used to fill Shark orders.
+
+The PowerShell-only `?local=1` demo also requests Shark quotes directly from the browser. Its non-crypto instruments are simulated. The watchlist labels each quote as Shark live, Upstox live, simulated, or feed unavailable. When Shark is unavailable, crypto paper orders pause until the feed returns.
 
 ## 5. Configure Trading Rules
 

@@ -11,6 +11,14 @@ const defaultContract = {
   instrumentKey: "MCX_FO|552719", lotSize: 360, tickSize: 0.1,
   initialPrice: 927.4, previousClose: 921.8, active: true
 };
+const sharkContracts = [
+  ["BTCINR", "BITCOIN"], ["ETHINR", "ETHEREUM"],
+  ["SOLINR", "SOLANA"], ["XRPINR", "XRP"]
+].map(([pair, name]) => ({
+  id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.slice(0, -3)}/INR`,
+  instrumentKey: `SHARK:${pair}`, lotSize: 1, tickSize: 0.01,
+  initialPrice: 1, previousClose: 1, active: true
+}));
 
 const TOKEN_KEY = "mentha-session-token";
 
@@ -23,7 +31,7 @@ const seedState = {
   orders: [],
   trades: [],
   ledger: [],
-  contracts: [defaultContract],
+  contracts: [defaultContract, ...sharkContracts],
   settings: { brokeragePerLot: 0, marginPerLot: 0 }
 };
 
@@ -60,6 +68,17 @@ function localStore() {
   try {
     const db = JSON.parse(localStorage.getItem("mentha-local-db") || "null") || structuredClone(seedState);
     db.contracts ||= structuredClone(seedState.contracts);
+    for (const contract of db.contracts) {
+      if (/^[A-Z0-9]+(?:INR|USDT)$/.test(String(contract.instrumentKey || "").toUpperCase())) contract.instrumentKey = `SHARK:${contract.instrumentKey.toUpperCase()}`;
+    }
+    let addedSharkContract = false;
+    for (const contract of sharkContracts) {
+      if (!db.contracts.some((item) => item.instrumentKey === contract.instrumentKey)) {
+        db.contracts.push(structuredClone(contract));
+        addedSharkContract = true;
+      }
+    }
+    if (addedSharkContract) saveLocalStore(db);
     const menthaContract = db.contracts.find((contract) => contract.id === DEFAULT_CONTRACT_ID);
     if (menthaContract) menthaContract.lotSize = SCRIP.lotSize;
     for (const order of db.orders) order.contractId ||= DEFAULT_CONTRACT_ID;
@@ -83,6 +102,11 @@ function contractFor(id = selectedContractId) {
 
 function initialQuote(contract) {
   if (contract.id === DEFAULT_CONTRACT_ID) return makeInitialMarket();
+  if (contract.instrumentKey?.startsWith("SHARK:")) return {
+    ...makeInitialMarket(), ltp: 0, prevClose: 0, open: 0, high: 0, low: 0,
+    avgPrice: 0, netChange: 0, changePercent: 0, volume: 0, ltq: 0,
+    bids: [], asks: [], source: "pending", instrumentKey: contract.instrumentKey
+  };
   const quote = makeInitialMarket();
   const ltp = Number(contract.initialPrice);
   const prevClose = Number(contract.previousClose);
@@ -120,9 +144,10 @@ function localId(prefix) {
 
 function localExecutablePrice(order) {
   const quote = quoteFor(order.contractId);
-  if (order.type === "MARKET") return order.side === "BUY" ? quote.asks[0][0] : quote.bids[0][0];
-  if (order.side === "BUY" && Number(order.price) >= quote.asks[0][0]) return quote.asks[0][0];
-  if (order.side === "SELL" && Number(order.price) <= quote.bids[0][0]) return quote.bids[0][0];
+  if (contractFor(order.contractId).instrumentKey?.startsWith("SHARK:") && quote.source !== "shark") return null;
+  if (order.type === "MARKET") return order.side === "BUY" ? quote.asks[0]?.[0] ?? null : quote.bids[0]?.[0] ?? null;
+  if (order.side === "BUY" && Number(order.price) >= (quote.asks[0]?.[0] ?? Infinity)) return quote.asks[0][0];
+  if (order.side === "SELL" && Number(order.price) <= (quote.bids[0]?.[0] ?? -Infinity)) return quote.bids[0][0];
   return null;
 }
 
@@ -195,14 +220,15 @@ async function localApi(path, options = {}) {
     };
   }
 
-  if (path === "/api/market") return { ...market, source: "demo" };
+  if (path === "/api/market") return market;
   if (path === "/api/markets") return { markets: Object.fromEntries(db.contracts.map((contract) => [contract.id, quoteFor(contract.id)])) };
 
   if (path === "/api/contracts" && method === "POST") {
     if (session.role !== "master") throw new Error("Master access required.");
     const name = String(body.name || "").trim().toUpperCase();
     const subtitle = String(body.subtitle || "").trim().toUpperCase();
-    const instrumentKey = String(body.instrumentKey || "").trim();
+    const enteredKey = String(body.instrumentKey || "").trim();
+    const instrumentKey = /^[A-Z0-9]+(?:INR|USDT)$/.test(enteredKey.toUpperCase()) ? `SHARK:${enteredKey.toUpperCase()}` : enteredKey;
     const lotSize = Number(body.lotSize);
     const tickSize = Number(body.tickSize);
     const initialPrice = Number(body.initialPrice);
@@ -337,6 +363,7 @@ async function localApi(path, options = {}) {
     const contract = db.contracts.find((item) => item.id === contractId && item.active);
     if (!contract) throw new Error("Contract is not available.");
     const type = String(body.type || "").toUpperCase();
+    if (contract.instrumentKey?.startsWith("SHARK:") && (quoteFor(contractId).source !== "shark" || (type === "MARKET" && (!quoteFor(contractId).bids.length || !quoteFor(contractId).asks.length)))) throw new Error("Shark price or order book is unavailable for this pair.");
     if (!["MARKET", "LIMIT"].includes(type)) throw new Error("Invalid order type.");
     if (type === "MARKET" && !user.allowMarketOrders) throw new Error("Market orders are disabled for this trader.");
     if (type === "LIMIT" && !user.allowLimitOrders) throw new Error("Limit orders are disabled for this trader.");
@@ -625,8 +652,8 @@ function normalizeMarket(data, previous = market) {
   next.previousOi = finiteNumber(next.previousOi ?? next.previous_oi ?? next.prev_oi, previous.previousOi ?? 0);
   next.oiChange = finiteNumber(next.oiChange ?? next.oi_change ?? next.oi_chg, next.previousOi ? next.oi - next.previousOi : previous.oiChange ?? 0);
   next.lastTradeTime = finiteNumber(next.lastTradeTime ?? next.last_trade_time, previous.lastTradeTime ?? 0);
-  next.bids = Array.isArray(data.bids) && data.bids.length ? data.bids : previous.bids;
-  next.asks = Array.isArray(data.asks) && data.asks.length ? data.asks : previous.asks;
+  next.bids = Array.isArray(data.bids) ? data.bids : previous.bids;
+  next.asks = Array.isArray(data.asks) ? data.asks : previous.asks;
   return next;
 }
 
@@ -664,8 +691,12 @@ async function bootstrap() {
 
 function startLocalMarket() {
   clearInterval(localMarketTimer);
+  updateLocalSharkMarket();
+  clearInterval(window.localSharkTimer);
+  window.localSharkTimer = setInterval(updateLocalSharkMarket, 5000);
   localMarketTimer = setInterval(() => {
     for (const contract of localStore().contracts.filter((item) => item.active)) {
+      if (contract.instrumentKey?.startsWith("SHARK:")) continue;
       const current = quoteFor(contract.id);
       const tick = Number(contract.tickSize);
       const next = Math.max(tick, roundTick(current.ltp + (Math.random() - 0.48) * tick * 16, tick));
@@ -685,6 +716,56 @@ function startLocalMarket() {
     localMatchOpenOrders();
     if (state.session) renderIfNotEditing();
   }, 1800);
+}
+
+let localSharkUpdating = false;
+async function updateLocalSharkMarket() {
+  if (localSharkUpdating) return;
+  localSharkUpdating = true;
+  try {
+    const contracts = localStore().contracts.filter((item) => item.active && /^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(item.instrumentKey));
+    await Promise.all(contracts.map(async (contract) => {
+      const pair = contract.instrumentKey.slice(6);
+      try {
+        const base = "https://api.sharkexchange.in/v1/market";
+        const [tickerResponse, depthResponse] = await Promise.all([
+          fetch(`${base}/ticker24Hr/${pair}`, { signal: AbortSignal.timeout(8000) }),
+          fetch(`${base}/depth/${pair}`, { signal: AbortSignal.timeout(8000) }).catch(() => null)
+        ]);
+        if (!tickerResponse.ok) {
+          const detail = (await tickerResponse.json().catch(() => null))?.message;
+          throw new Error(`Shark HTTP ${tickerResponse.status}${detail ? `: ${detail}` : ""}`);
+        }
+        const ticker = (await tickerResponse.json()).data;
+        if (ticker?.s !== pair || !Number.isFinite(Number(ticker.c)) || Number(ticker.c) <= 0) throw new Error("Invalid Shark ticker");
+        const depth = depthResponse?.ok ? (await depthResponse.json().catch(() => null))?.data : null;
+        const levels = (rows) => (Array.isArray(rows) ? rows : [])
+          .map(([price, qty]) => [Number(price), Number(qty), 0])
+          .filter(([price, qty]) => price > 0 && qty > 0).slice(0, 5);
+        const ltp = Number(ticker.c);
+        const change = Number(ticker.p);
+        const prevClose = ltp - (Number.isFinite(change) ? change : ltp - Number(ticker.o));
+        markets[contract.id] = {
+          ltp, prevClose, open: Number(ticker.o) || ltp, high: Number(ticker.h) || ltp,
+          low: Number(ticker.l) || ltp, avgPrice: Number(ticker.w) || ltp,
+          netChange: ltp - prevClose, changePercent: prevClose ? (ltp - prevClose) / prevClose * 100 : 0,
+          volume: Number(ticker.v) || 0, ltq: Number(ticker.Q) || 0,
+          lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
+          bids: depth?.s === pair ? levels(depth.b) : [],
+          asks: depth?.s === pair ? levels(depth.a) : [],
+          source: "shark", instrumentKey: contract.instrumentKey,
+          timestamp: new Date(Number(ticker.E) || Date.now()).toISOString()
+        };
+      } catch (error) {
+        markets[contract.id] = { ...initialQuote(contract), error: error.message };
+      }
+    }));
+    market = quoteFor(selectedContractId);
+    localMatchOpenOrders();
+    if (state.session) renderIfNotEditing();
+  } finally {
+    localSharkUpdating = false;
+  }
 }
 
 function roundTick(value, tick = contractFor().tickSize) {
@@ -707,6 +788,7 @@ async function refreshState(showErrors = true) {
     state = { ...state, ...stateData };
     for (const contract of state.contracts || []) {
       markets[contract.id] = normalizeMarket(marketData.markets?.[contract.id] || {}, quoteFor(contract.id));
+      if (markets[contract.id].source === "pending") markets[contract.id].error = marketData.markets?.[contract.id]?.error || marketData.error || markets[contract.id].error;
     }
     if (!state.contracts.some((contract) => contract.id === selectedContractId && contract.active)) {
       selectedContractId = state.contracts.find((contract) => contract.active)?.id || DEFAULT_CONTRACT_ID;
@@ -783,8 +865,8 @@ function shellTemplate() {
             </div>
           </div>
           <div class="header-price">
-            <strong class="${change >= 0 ? "up" : "down"}">${fmt(market.ltp, 2)}</strong>
-            <span class="${change >= 0 ? "up" : "down"}">${signed(change)} (${signed(pct)}%)</span>
+            <strong class="${change >= 0 ? "up" : "down"}">${market.source === "pending" ? "—" : fmt(market.ltp, 2)}</strong>
+            <span class="${change >= 0 ? "up" : "down"}">${market.source === "pending" ? "Feed unavailable" : `${signed(change)} (${signed(pct)}%)`}</span>
           </div>
         </header>
 
@@ -839,8 +921,8 @@ function watchlistTemplate() {
         const change = Number(quote.netChange ?? quote.ltp - quote.prevClose);
         const pct = Number(quote.changePercent ?? (quote.prevClose ? change / quote.prevClose * 100 : 0));
         return `<button class="watchlist-item" type="button" data-contract="${esc(contract.id)}">
-          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)}</small></span>
-          <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${fmt(quote.ltp, 2)}</strong><small>${signed(change)} (${Math.abs(pct).toFixed(2)}%)</small></span>
+          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)} · ${quote.source === "shark" ? "Shark live" : quote.source === "pending" ? "Feed unavailable" : quote.source === "upstox" ? "Upstox live" : "Simulated"}</small></span>
+          <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${quote.source === "pending" ? "—" : fmt(quote.ltp, 2)}</strong><small>${quote.source === "pending" ? "Awaiting Shark" : `${signed(change)} (${Math.abs(pct).toFixed(2)}%)`}</small></span>
         </button>`;
       }).join("") : empty("No contracts available")}
     </section>
@@ -864,6 +946,7 @@ function navButton(view, icon, label) {
 }
 
 function marketTemplate(pulse = false) {
+  if (market.source === "pending") return `<section class="market-card"><div class="section-title-row"><h2>Today's Market</h2><span class="chip">Feed unavailable</span></div><p class="muted">${esc(market.error || "Waiting for Shark Exchange data.")}</p></section>`;
   const { change, pct } = marketMove();
   const isShark = contractFor().instrumentKey?.startsWith("SHARK:");
   const lower = finiteNumber(market.lowerCircuit, market.prevClose * 0.96);
@@ -884,7 +967,7 @@ function marketTemplate(pulse = false) {
   return `
     <section class="market-card ${pulse ? "pulse-board" : ""}">
       <div class="section-title-row">
-        <h2>Today's Market</h2>
+        <h2>Today's Market</h2><span class="chip">${market.source === "shark" ? "Shark live" : market.source === "pending" ? "Feed unavailable" : market.source === "upstox" ? "Upstox live" : "Simulated"}</span>
       </div>
       <div class="today-grid">
         <div><span>Open</span><strong>${fmt(market.open, 2)}</strong></div>
@@ -909,6 +992,7 @@ function marketTemplate(pulse = false) {
 }
 
 function depthTemplate() {
+  if (market.source === "pending") return `<section class="depth-card"><h2>Market Depth</h2><p class="muted">Waiting for Shark Exchange data.</p></section>`;
   const isShark = contractFor().instrumentKey?.startsWith("SHARK:");
   const qty = (value) => isShark ? fmt(value, 6) : whole(value);
   const rows = Array.from({ length: 5 }, (_, index) => ({
@@ -973,6 +1057,9 @@ function tradeTemplate(pos) {
   const margin = Number(trader?.marginPerLot || 0);
   const allowMarketOrders = trader?.allowMarketOrders !== false;
   const allowLimitOrders = trader?.allowLimitOrders !== false;
+  if (contractFor().instrumentKey?.startsWith("SHARK:") && market.source !== "shark") {
+    return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Shark price feed is unavailable${market.error ? `: ${esc(market.error)}` : ""}. Paper orders resume when live quotes return.</p></section>`;
+  }
   if (!allowMarketOrders && !allowLimitOrders) {
     return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Market and limit orders are disabled for your account. Contact the admin to enable trading.</p></section>`;
   }

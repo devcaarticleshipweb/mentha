@@ -97,11 +97,12 @@ function publicUser(row) {
 }
 
 function publicContract(row) {
+  const rawInstrumentKey = String(row.instrument_key || "").trim().toUpperCase();
   return {
     id: row.id,
     name: row.name,
     subtitle: row.subtitle,
-    instrumentKey: row.instrument_key,
+    instrumentKey: /^[A-Z0-9]+(?:INR|USDT)$/.test(rawInstrumentKey) ? `SHARK:${rawInstrumentKey}` : row.instrument_key,
     lotSize: row.id === "MENTHAOIL-OCT26" ? 360 : Number(row.lot_size),
     tickSize: Number(row.tick_size),
     initialPrice: Number(row.initial_price),
@@ -170,7 +171,10 @@ async function fetchSharkQuote(contract) {
     fetch(`${base}/ticker24Hr/${pair}`, { signal: AbortSignal.timeout(8000) }),
     fetch(`${base}/depth/${pair}`, { signal: AbortSignal.timeout(8000) }).catch(() => null)
   ]);
-  if (!tickerResponse.ok) throw new Error(`Shark ${pair} HTTP ${tickerResponse.status}`);
+  if (!tickerResponse.ok) {
+    const detail = (await tickerResponse.json().catch(() => null))?.message;
+    throw new Error(`Shark ${pair} HTTP ${tickerResponse.status}${detail ? `: ${detail}` : ""}`);
+  }
   const ticker = (await tickerResponse.json()).data;
   const depth = depthResponse?.ok ? (await depthResponse.json().catch(() => null))?.data : null;
   return parseSharkQuote(ticker, depth, contract);
@@ -261,7 +265,31 @@ function executablePrice(order, quote) {
   return null;
 }
 
+let sharkSeedPromise;
+function ensureSharkContracts() {
+  if (!sharkSeedPromise) sharkSeedPromise = (async () => {
+    const existing = await db(supabase.from("contracts").select("instrument_key"));
+    const keys = new Set(existing.map((row) => String(row.instrument_key).toUpperCase()));
+    const defaults = [
+      ["BTCINR", "BITCOIN"], ["ETHINR", "ETHEREUM"],
+      ["SOLINR", "SOLANA"], ["XRPINR", "XRP"]
+    ];
+    const missing = defaults.filter(([pair]) => !keys.has(pair) && !keys.has(`SHARK:${pair}`))
+      .map(([pair, name]) => ({
+        id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.slice(0, -3)}/INR`,
+        instrument_key: `SHARK:${pair}`, lot_size: 1, tick_size: 0.01,
+        initial_price: 1, previous_close: 1, active: true
+      }));
+    if (missing.length) await db(supabase.from("contracts").upsert(missing, { onConflict: "instrument_key", ignoreDuplicates: true }));
+  })().catch((error) => {
+    sharkSeedPromise = null;
+    throw error;
+  });
+  return sharkSeedPromise;
+}
+
 async function loadContracts() {
+  await ensureSharkContracts();
   contractsCache = (await db(supabase.from("contracts").select("*").order("created_at", { ascending: true }))).map((row) => {
     const contract = publicContract(row);
     if (contract.id === "MENTHAOIL-OCT26") contract.instrumentKey = UPSTOX_INSTRUMENT_KEY;
@@ -589,7 +617,8 @@ app.post("/api/contracts", requireAuth, requireMaster, async (req, res) => {
   try {
     const name = String(req.body.name || "").trim().toUpperCase();
     const subtitle = String(req.body.subtitle || "").trim().toUpperCase();
-    const instrumentKey = String(req.body.instrumentKey || "").trim();
+    const enteredKey = String(req.body.instrumentKey || "").trim();
+    const instrumentKey = /^[A-Z0-9]+(?:INR|USDT)$/.test(enteredKey.toUpperCase()) ? `SHARK:${enteredKey.toUpperCase()}` : enteredKey;
     const lotSize = Number(req.body.lotSize);
     const tickSize = Number(req.body.tickSize);
     const initialPrice = Number(req.body.initialPrice);
