@@ -18,7 +18,7 @@ If the last schema change you applied was individual margin and brokerage rates,
 If login reports that `public.contracts` is missing from the schema cache, run the migration in the Supabase project configured by Render's `SUPABASE_URL`. Its final query should return `public.contracts`. The migration also requests a PostgREST schema cache reload.
 The latest schema also adds `fund_ledger`, used for opening balance and fund addition/removal history.
 For an existing deployment, run `supabase-fix-mentha-lot-size.sql` in Supabase SQL Editor to correct the MENTHAOIL contract to 360 kg per lot.
-The backend automatically adds the four default Shark crypto pairs to an existing database on startup. `supabase-add-shark-crypto.sql` remains available if you need to add them manually. A fresh project gets these pairs from `supabase-schema.sql`.
+For an existing deployment, run `supabase-add-shark-crypto.sql` in Supabase SQL Editor **before** deploying this update. It expands order and trade price columns to four decimals for XRP/USDT, then adds the INR and USDT crypto contracts. The backend also seeds missing contracts on startup. A fresh project gets the contracts and price precision from `supabase-schema.sql`.
 
 ## 2. Push Project To GitHub
 
@@ -72,7 +72,9 @@ Create users from the Admin tab. Users can then login from their own phone.
 
 The master-only Contracts tab adds instruments to every trader's Watchlist. Enter the instrument's Upstox key, lot size, tick size, and starting and previous-close prices. The starting prices are used when the Upstox token is unavailable. Traders can open a watchlist row to view its market depth and place paper orders for that contract.
 
-Bitcoin, Ethereum, Solana, and XRP INR perpetual pairs use Shark Exchange's public Socket.IO ticker and depth stream. They need no Shark API key. Other supported INR or USDT pairs can be added in Contracts using an instrument key such as `SHARK:BNBINR` or `SHARK:BTCUSDT`. Shark quotes show as unavailable until a valid exchange response arrives; simulated prices are never used to fill Shark orders.
+Bitcoin, Ethereum, Solana, and XRP INR and USDT perpetual pairs use Shark Exchange's public Socket.IO ticker and depth stream. They need no Shark API key. USDT is a dollar-pegged token; these markets are quoted in USDT, not bank USD. Other supported INR or USDT pairs can be added in Contracts using an instrument key such as `SHARK:BNBINR` or `SHARK:BTCUSDT`. Shark quotes show as unavailable until a valid exchange response arrives; simulated prices are never used to fill Shark orders.
+
+Paper trading keeps balances, margin, brokerage, and P&L in INR. For USDT contracts, the app adds the numeric USDT price difference directly to INR P&L, with no exchange-rate conversion. For example, a 1 USDT gain on one unit adds ₹1. This is a deliberate paper-accounting rule, not an economic USD/INR valuation.
 
 If the Render server cannot reach Shark's stream, the browser displays Shark's public stream as a view-only quote. Paper orders remain paused until the server receives its own live quote. The `/health` endpoint reports `sharkStream` and each crypto pair's server quote source for diagnosis.
 

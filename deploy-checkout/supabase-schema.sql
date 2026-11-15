@@ -17,8 +17,8 @@ create table if not exists public.contracts (
   instrument_key text not null unique,
   lot_size integer not null default 360 check (lot_size > 0),
   tick_size numeric(10, 4) not null default 0.1 check (tick_size > 0),
-  initial_price numeric(14, 2) not null default 0 check (initial_price > 0),
-  previous_close numeric(14, 2) not null default 0 check (previous_close > 0),
+  initial_price numeric(14, 4) not null default 0 check (initial_price > 0),
+  previous_close numeric(14, 4) not null default 0 check (previous_close > 0),
   active boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -32,7 +32,11 @@ values
   ('SHARK-BTCINR', 'BITCOIN', 'SHARK BTC/INR', 'SHARK:BTCINR', 1, 0.01, 1, 1),
   ('SHARK-ETHINR', 'ETHEREUM', 'SHARK ETH/INR', 'SHARK:ETHINR', 1, 0.01, 1, 1),
   ('SHARK-SOLINR', 'SOLANA', 'SHARK SOL/INR', 'SHARK:SOLINR', 1, 0.01, 1, 1),
-  ('SHARK-XRPINR', 'XRP', 'SHARK XRP/INR', 'SHARK:XRPINR', 1, 0.01, 1, 1)
+  ('SHARK-XRPINR', 'XRP', 'SHARK XRP/INR', 'SHARK:XRPINR', 1, 0.01, 1, 1),
+  ('SHARK-BTCUSDT', 'BITCOIN', 'SHARK BTC/USDT', 'SHARK:BTCUSDT', 1, 0.01, 1, 1),
+  ('SHARK-ETHUSDT', 'ETHEREUM', 'SHARK ETH/USDT', 'SHARK:ETHUSDT', 1, 0.01, 1, 1),
+  ('SHARK-SOLUSDT', 'SOLANA', 'SHARK SOL/USDT', 'SHARK:SOLUSDT', 1, 0.01, 1, 1),
+  ('SHARK-XRPUSDT', 'XRP', 'SHARK XRP/USDT', 'SHARK:XRPUSDT', 1, 0.0001, 1, 1)
 on conflict (id) do nothing;
 
 create table if not exists public.fund_ledger (
@@ -50,9 +54,9 @@ create table if not exists public.orders (
   side text not null check (side in ('BUY', 'SELL')),
   type text not null check (type in ('MARKET', 'LIMIT')),
   qty integer not null check (qty > 0),
-  price numeric(12, 2),
+  price numeric(16, 4),
   status text not null check (status in ('OPEN', 'FILLED', 'CANCELLED')) default 'OPEN',
-  fill_price numeric(12, 2),
+  fill_price numeric(16, 4),
   created_at timestamptz not null default now(),
   filled_at timestamptz,
   cancelled_at timestamptz
@@ -67,7 +71,7 @@ create table if not exists public.trades (
   user_id text not null references public.app_users(id) on delete cascade,
   side text not null check (side in ('BUY', 'SELL')),
   qty integer not null check (qty > 0),
-  price numeric(12, 2) not null,
+  price numeric(16, 4) not null,
   brokerage numeric(12, 2) not null default 0,
   created_at timestamptz not null default now()
 );

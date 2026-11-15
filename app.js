@@ -12,11 +12,13 @@ const defaultContract = {
   initialPrice: 927.4, previousClose: 921.8, active: true
 };
 const sharkContracts = [
-  ["BTCINR", "BITCOIN"], ["ETHINR", "ETHEREUM"],
-  ["SOLINR", "SOLANA"], ["XRPINR", "XRP"]
-].map(([pair, name]) => ({
-  id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.slice(0, -3)}/INR`,
-  instrumentKey: `SHARK:${pair}`, lotSize: 1, tickSize: 0.01,
+  ["BTCINR", "BITCOIN", 0.01], ["ETHINR", "ETHEREUM", 0.01],
+  ["SOLINR", "SOLANA", 0.01], ["XRPINR", "XRP", 0.01],
+  ["BTCUSDT", "BITCOIN", 0.01], ["ETHUSDT", "ETHEREUM", 0.01],
+  ["SOLUSDT", "SOLANA", 0.01], ["XRPUSDT", "XRP", 0.0001]
+].map(([pair, name, tickSize]) => ({
+  id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.replace(/(INR|USDT)$/, "/$1")}`,
+  instrumentKey: `SHARK:${pair}`, lotSize: 1, tickSize,
   initialPrice: 1, previousClose: 1, active: true
 }));
 
@@ -238,7 +240,7 @@ async function localApi(path, options = {}) {
     const previousClose = Number(body.previousClose);
     if (!name || !subtitle || !instrumentKey) throw new Error("Enter contract name, exchange/expiry and instrument key.");
     if (db.contracts.some((item) => item.instrumentKey === instrumentKey)) throw new Error("Instrument key already exists.");
-    if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.01 || Math.abs(tickSize * 100 - Math.round(tickSize * 100)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) throw new Error("Enter valid lot size, tick size and prices.");
+    if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.0001 || Math.abs(tickSize * 10000 - Math.round(tickSize * 10000)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) throw new Error("Enter valid lot size, tick size and prices.");
     const contract = { id: localId("CONTRACT"), name, subtitle, instrumentKey, lotSize, tickSize, initialPrice, previousClose, active: true };
     db.contracts.push(contract);
     markets[contract.id] = initialQuote(contract);
@@ -440,12 +442,25 @@ function fmt(n, d = 2) {
   return Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
 }
 
+function quoteDigits(contractId = selectedContractId) {
+  return Number(contractFor(contractId).tickSize) < 0.01 ? 4 : 2;
+}
+
+function quoteUnit(contractId = selectedContractId) {
+  return contractFor(contractId).instrumentKey?.endsWith("USDT") ? "USDT" : "INR";
+}
+
+function quotePrice(value, contractId = selectedContractId) {
+  const amount = fmt(value, quoteDigits(contractId));
+  return quoteUnit(contractId) === "USDT" ? `${amount} USDT` : `₹${amount}`;
+}
+
 function whole(n) {
   return Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 });
 }
 
-function signed(n) {
-  return `${n >= 0 ? "+" : ""}${fmt(n)}`;
+function signed(n, digits = 2) {
+  return `${n >= 0 ? "+" : ""}${fmt(n, digits)}`;
 }
 
 function finiteNumber(value, fallback = 0) {
@@ -826,7 +841,7 @@ function startLocalSharkStream() {
 }
 
 function roundTick(value, tick = contractFor().tickSize) {
-  return Math.round(value / tick) * tick;
+  return Number((Math.round(Number(value) / tick) * tick).toFixed(4));
 }
 
 function startRefresh() {
@@ -927,8 +942,8 @@ function shellTemplate() {
             </div>
           </div>
           <div class="header-price">
-            <strong class="${change >= 0 ? "up" : "down"}">${market.source === "pending" ? "—" : fmt(market.ltp, 2)}</strong>
-            <span class="${change >= 0 ? "up" : "down"}">${market.source === "pending" ? "Feed unavailable" : `${signed(change)} (${signed(pct)}%)`}</span>
+            <strong class="${change >= 0 ? "up" : "down"}">${market.source === "pending" ? "—" : quotePrice(market.ltp)}</strong>
+            <span class="${change >= 0 ? "up" : "down"}">${market.source === "pending" ? "Feed unavailable" : `${signed(change, quoteDigits())} ${quoteUnit()} (${signed(pct)}%)`}</span>
           </div>
         </header>
 
@@ -984,7 +999,7 @@ function watchlistTemplate() {
         const pct = Number(quote.changePercent ?? (quote.prevClose ? change / quote.prevClose * 100 : 0));
         return `<button class="watchlist-item" type="button" data-contract="${esc(contract.id)}">
           <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)} · ${quote.source === "shark" ? "Shark live" : quote.source === "shark-browser" ? "Shark live · view only" : quote.source === "pending" ? "Feed unavailable" : quote.source === "upstox" ? "Upstox live" : "Simulated"}</small></span>
-          <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${quote.source === "pending" ? "—" : fmt(quote.ltp, 2)}</strong><small>${quote.source === "pending" ? "Awaiting Shark" : `${signed(change)} (${Math.abs(pct).toFixed(2)}%)`}</small></span>
+          <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${quote.source === "pending" ? "—" : quotePrice(quote.ltp, contract.id)}</strong><small>${quote.source === "pending" ? "Awaiting Shark" : `${signed(change, quoteDigits(contract.id))} ${quoteUnit(contract.id)} (${Math.abs(pct).toFixed(2)}%)`}</small></span>
         </button>`;
       }).join("") : empty("No contracts available")}
     </section>
@@ -1017,10 +1032,10 @@ function marketTemplate(pulse = false) {
   const circuitPos = circuitRange > 0 ? Math.max(4, Math.min(96, ((market.ltp - lower) / circuitRange) * 100)) : 50;
   const detailRows = [
     ["Volume", whole(market.volume)],
-    ["Avg. traded price", fmt(market.avgPrice, 2)],
+    ["Avg. traded price", quotePrice(market.avgPrice)],
     ["Last traded time", formatTradeTime(market.lastTradeTime || market.timestamp || market.lastTick)],
     ["Last traded quantity", isShark ? fmt(market.ltq, 6) : whole(market.ltq)],
-    ["Spot", fmt(market.ltp, 2)],
+    ["Spot", quotePrice(market.ltp)],
     ["Last trading date", isShark ? "Perpetual" : "30 Oct 26"],
     ["Expiry", isShark ? "Perpetual" : "30 Oct 26"],
     ["OI (chg)", signed(market.oiChange || 0)],
@@ -1032,12 +1047,12 @@ function marketTemplate(pulse = false) {
         <h2>Today's Market</h2><span class="chip">${market.source === "shark" ? "Shark live" : market.source === "shark-browser" ? "Shark live · view only" : market.source === "pending" ? "Feed unavailable" : market.source === "upstox" ? "Upstox live" : "Simulated"}</span>
       </div>
       <div class="today-grid">
-        <div><span>Open</span><strong>${fmt(market.open, 2)}</strong></div>
-        <div><span>High</span><strong>${fmt(market.high, 2)}</strong></div>
-        <div><span>Low</span><strong>${fmt(market.low, 2)}</strong></div>
+        <div><span>Open</span><strong>${quotePrice(market.open)}</strong></div>
+        <div><span>High</span><strong>${quotePrice(market.high)}</strong></div>
+        <div><span>Low</span><strong>${quotePrice(market.low)}</strong></div>
         <div class="prev-close-cell">
           <span>${isShark ? "24h reference" : "Prev. close"}</span>
-          <strong>${fmt(market.prevClose, 2)}</strong>
+          <strong>${quotePrice(market.prevClose)}</strong>
           <button class="market-toggle" type="button" data-market-toggle aria-label="${marketDetailsExpanded ? "Hide market details" : "Show market details"}">${marketDetailsExpanded ? "⌃" : "⌄"}</button>
         </div>
       </div>
@@ -1067,7 +1082,7 @@ function depthTemplate() {
   const buyPct = totalBuy + totalSell ? Math.round((totalBuy / (totalBuy + totalSell)) * 100) : 50;
   return `
     <section class="depth-card">
-      <h2>Market Depth</h2>
+      <h2>Market Depth · ${quoteUnit()}</h2>
       <div class="depth-table">
         <div class="depth-head"><span>Qty</span><span>Orders</span><span>Bid</span><span>Ask</span><span>Orders</span><span>Qty</span></div>
         ${rows.map(({ bid, ask }) => `
@@ -1076,8 +1091,8 @@ function depthTemplate() {
             <span class="depth-side-bar sell-depth"></span>
             <span class="qty-cell">${qty(bid[1])}</span>
             <span class="order-count">${isShark ? "—" : whole(bid[2] || 0)}</span>
-            <strong>${fmt(bid[0], 2)}</strong>
-            <strong>${fmt(ask[0], 2)}</strong>
+            <strong>${fmt(bid[0], quoteDigits())}</strong>
+            <strong>${fmt(ask[0], quoteDigits())}</strong>
             <span class="order-count">${isShark ? "—" : whole(ask[2] || 0)}</span>
             <span class="qty-cell">${qty(ask[1])}</span>
           </div>
@@ -1140,8 +1155,9 @@ function tradeTemplate(pos) {
           <label class="field"><span class="label">Order type</span><select id="orderType">${allowMarketOrders ? "<option>MARKET</option>" : ""}${allowLimitOrders ? "<option>LIMIT</option>" : ""}</select></label>
           <label class="field"><span class="label">Lots</span><input id="orderQty" type="number" min="1" step="1" value="${lastQty}"></label>
         </div>
-        ${allowLimitOrders ? `<label class="field"><span class="label">Limit price</span><input id="orderPrice" type="number" step="${contractFor().tickSize}" value="${Number(activeSide === "BUY" ? market.asks[0]?.[0] ?? market.ltp : market.bids[0]?.[0] ?? market.ltp).toFixed(2)}"></label>` : ""}
+        ${allowLimitOrders ? `<label class="field"><span class="label">Limit price (${quoteUnit()})</span><input id="orderPrice" type="number" step="${contractFor().tickSize}" value="${Number(activeSide === "BUY" ? market.asks[0]?.[0] ?? market.ltp : market.bids[0]?.[0] ?? market.ltp).toFixed(quoteDigits())}"></label>` : ""}
         <p class="muted">${allowMarketOrders ? "Market buy fills at best ask, market sell fills at best bid. " : ""}${allowLimitOrders ? "Limit orders fill when LTP reaches the limit. " : ""}Brokerage ${whole(brokerage)} per lot.</p>
+        ${quoteUnit() === "USDT" ? `<p class="muted">Paper accounting: USDT price differences use the same number in your INR P&amp;L and balance, without an exchange-rate conversion.</p>` : ""}
         <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(contractFor().name)}</button>
       </form>
     </section>
@@ -1168,9 +1184,9 @@ function orderItem(o) {
         <span class="chip">${esc(o.status)}</span>
       </div>
       <div class="order-times"><small>Created: ${new Date(o.createdAt).toLocaleString()}</small><small>Executed: ${o.filledAt ? new Date(o.filledAt).toLocaleString() : o.status === "OPEN" ? "Pending" : "Not executed"}</small></div>
-      <div class="row" style="margin-top:8px"><span>${o.type === "LIMIT" ? `Limit ₹${fmt(o.price)}` : "Market"}${o.status === "FILLED" && o.fillPrice != null ? ` · Filled ₹${fmt(o.fillPrice)}` : ""}</span>${o.status === "OPEN" || isMaster() && o.status === "FILLED" ? `<button class="ghost" data-cancel="${esc(o.id)}">${o.status === "FILLED" ? "Void" : "Cancel"}</button>` : ""}</div>
+      <div class="row" style="margin-top:8px"><span>${o.type === "LIMIT" ? `Limit ${quotePrice(o.price, o.contractId)}` : "Market"}${o.status === "FILLED" && o.fillPrice != null ? ` · Filled ${quotePrice(o.fillPrice, o.contractId)}` : ""}</span>${o.status === "OPEN" || isMaster() && o.status === "FILLED" ? `<button class="ghost" data-cancel="${esc(o.id)}">${o.status === "FILLED" ? "Void" : "Cancel"}</button>` : ""}</div>
       ${adminFill || adminEdit ? `<form class="order-admin-form" data-${adminFill ? "manual-fill" : "edit-fill-price"}="${esc(o.id)}">
-        <label class="field"><span class="label">${adminFill ? "Execution price" : "New filled price"}</span><input name="price" type="number" min="0.01" max="9999999999.99" step="0.01" value="${adminFill ? Number(o.price) : Number(o.fillPrice)}" required></label>
+        <label class="field"><span class="label">${adminFill ? "Execution price" : "New filled price"} (${quoteUnit(o.contractId)})</span><input name="price" type="number" min="${contractFor(o.contractId).tickSize}" max="9999999999.9999" step="${contractFor(o.contractId).tickSize}" value="${adminFill ? Number(o.price) : Number(o.fillPrice)}" required></label>
         <button class="secondary" type="submit">${adminFill ? "Fill now" : "Change price"}</button>
       </form>` : ""}
     </article>
@@ -1267,7 +1283,7 @@ function contractsAdminTemplate() {
         <label class="field"><span class="label">Upstox key or Shark pair</span><input name="instrumentKey" placeholder="MCX_FO|... or SHARK:BTCINR" required></label>
         <div class="form-grid">
           <label class="field"><span class="label">Lot size</span><input name="lotSize" type="number" min="1" step="1" value="1" required></label>
-          <label class="field"><span class="label">Tick size</span><input name="tickSize" type="number" min="0.01" step="0.01" value="0.1" required></label>
+          <label class="field"><span class="label">Tick size</span><input name="tickSize" type="number" min="0.0001" step="0.0001" value="0.1" required></label>
         </div>
         <div class="form-grid">
           <label class="field"><span class="label">Starting price</span><input name="initialPrice" type="number" min="0.01" step="0.01" required></label>
@@ -1380,8 +1396,8 @@ function openPositionItem(item) {
       </div>
       <div class="position-right">
         <strong class="${item.pnl >= 0 ? "up" : "down"}">${signed(item.pnl)}</strong>
-        <span>${fmt(item.avg, 2)} Avg.</span>
-        <span>${fmt(item.ltp, 2)} LTP</span>
+        <span>${quotePrice(item.avg, item.contractId)} Avg.</span>
+        <span>${quotePrice(item.ltp, item.contractId)} LTP</span>
       </div>
     </article>
   `;
@@ -1398,7 +1414,7 @@ function closedPositionItem(item) {
       <div class="position-right">
         <strong class="${item.pnl >= 0 ? "up" : "down"}">${signed(item.pnl)}</strong>
         <span>0.00 Avg.</span>
-        <span>${fmt(item.exit, 2)} LTP</span>
+        <span>${quotePrice(item.exit, item.contractId)} LTP</span>
       </div>
     </article>
   `;
@@ -1451,7 +1467,7 @@ function ledgerRowsFor(userId, pos) {
     id: `${item.id}-pnl`,
     time: item.time,
     title: "Trade P&L",
-    note: `${item.side} ${item.qty} lot · Entry ${fmt(item.entry, 1)} · Exit ${fmt(item.exit, 1)}`,
+    note: `${item.side} ${item.qty} lot · Entry ${quotePrice(item.entry, item.contractId)} · Exit ${quotePrice(item.exit, item.contractId)}`,
     amount: item.grossPnl,
     kind: item.grossPnl >= 0 ? "credit" : "debit"
   }));
