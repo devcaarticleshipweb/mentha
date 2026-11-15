@@ -772,7 +772,7 @@ function applyLocalSharkEvent(event, data) {
   const liveSource = window.MENTHA_LOCAL_ONLY ? "shark" : "shark-browser";
   if (event === "depthUpdate") {
     const depth = { bids: localSharkLevels(data.b, true), asks: localSharkLevels(data.a, false) };
-    localSharkDepth.set(pair, depth);
+    localSharkDepth.set(pair, { ...depth, receivedAt: Date.now() });
     if (target[contract.id]?.source === liveSource) target[contract.id] = { ...target[contract.id], ...depth };
   } else if (event === "24hrTicker") {
     const ltp = Number(data.c);
@@ -785,7 +785,8 @@ function applyLocalSharkEvent(event, data) {
       netChange: ltp - prevClose, changePercent: prevClose ? (ltp - prevClose) / prevClose * 100 : 0,
       volume: Number(data.v) || 0, ltq: Number(data.Q) || 0,
       lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
-      ...(localSharkDepth.get(pair) || { bids: [], asks: [] }),
+      ...((Date.now() - (localSharkDepth.get(pair)?.receivedAt || 0) < 15000)
+        ? localSharkDepth.get(pair) : { bids: [], asks: [] }),
       source: liveSource, instrumentKey: contract.instrumentKey,
       timestamp: new Date(Number(data.E) || Date.now()).toISOString()
     };
@@ -853,7 +854,18 @@ function startRefresh() {
   }
   refreshTimer = setInterval(() => {
     refreshState(false).catch(() => {});
+    relayBrowserSharkQuotes().catch(() => {});
   }, 2500);
+}
+
+async function relayBrowserSharkQuotes(contractId = null) {
+  if (window.MENTHA_LOCAL_ONLY || !state.session || state.session.role !== "user" || !token()) return 0;
+  const contracts = localSharkContracts().filter((contract) => !contractId || contract.id === contractId);
+  const quotes = contracts.map((contract) => ({ contractId: contract.id, quote: browserSharkMarkets[contract.id] }))
+    .filter(({ quote }) => quote?.source === "shark-browser" && Date.now() - Date.parse(quote.timestamp) < 15000);
+  if (!quotes.length) return 0;
+  const result = await api("/api/shark/quotes", { method: "POST", body: JSON.stringify({ quotes }) });
+  return Number(result.accepted || 0);
 }
 
 async function refreshState(showErrors = true) {
@@ -998,7 +1010,7 @@ function watchlistTemplate() {
         const change = Number(quote.netChange ?? quote.ltp - quote.prevClose);
         const pct = Number(quote.changePercent ?? (quote.prevClose ? change / quote.prevClose * 100 : 0));
         return `<button class="watchlist-item" type="button" data-contract="${esc(contract.id)}">
-          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)} · ${quote.source === "shark" ? "Shark live" : quote.source === "shark-browser" ? "Shark live · view only" : quote.source === "pending" ? "Feed unavailable" : quote.source === "upstox" ? "Upstox live" : "Simulated"}</small></span>
+          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)} · ${quote.source === "shark" ? "Shark live" : quote.source === "shark-browser" ? "Shark live · paper trading" : quote.source === "pending" ? "Feed unavailable" : quote.source === "upstox" ? "Upstox live" : "Simulated"}</small></span>
           <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${quote.source === "pending" ? "—" : quotePrice(quote.ltp, contract.id)}</strong><small>${quote.source === "pending" ? "Awaiting Shark" : `${signed(change, quoteDigits(contract.id))} ${quoteUnit(contract.id)} (${Math.abs(pct).toFixed(2)}%)`}</small></span>
         </button>`;
       }).join("") : empty("No contracts available")}
@@ -1044,7 +1056,7 @@ function marketTemplate(pulse = false) {
   return `
     <section class="market-card ${pulse ? "pulse-board" : ""}">
       <div class="section-title-row">
-        <h2>Today's Market</h2><span class="chip">${market.source === "shark" ? "Shark live" : market.source === "shark-browser" ? "Shark live · view only" : market.source === "pending" ? "Feed unavailable" : market.source === "upstox" ? "Upstox live" : "Simulated"}</span>
+        <h2>Today's Market</h2><span class="chip">${market.source === "shark" ? "Shark live" : market.source === "shark-browser" ? "Shark live · paper trading" : market.source === "pending" ? "Feed unavailable" : market.source === "upstox" ? "Upstox live" : "Simulated"}</span>
       </div>
       <div class="today-grid">
         <div><span>Open</span><strong>${quotePrice(market.open)}</strong></div>
@@ -1134,11 +1146,11 @@ function tradeTemplate(pos) {
   const margin = Number(trader?.marginPerLot || 0);
   const allowMarketOrders = trader?.allowMarketOrders !== false;
   const allowLimitOrders = trader?.allowLimitOrders !== false;
-  if (market.source === "shark-browser") {
-    return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Live Shark prices are visible. Paper orders are paused until the server connects to Shark.</p></section>`;
-  }
-  if (contractFor().instrumentKey?.startsWith("SHARK:") && market.source !== "shark") {
+  if (contractFor().instrumentKey?.startsWith("SHARK:") && !["shark", "shark-browser"].includes(market.source)) {
     return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Shark price feed is unavailable${market.error ? `: ${esc(market.error)}` : ""}. Paper orders resume when live quotes return.</p></section>`;
+  }
+  if (market.source === "shark-browser" && (!market.bids.length || !market.asks.length)) {
+    return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Waiting for Shark order book depth before paper trading.</p></section>`;
   }
   if (!allowMarketOrders && !allowLimitOrders) {
     return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Market and limit orders are disabled for your account. Contact the admin to enable trading.</p></section>`;
@@ -1157,6 +1169,7 @@ function tradeTemplate(pos) {
         </div>
         ${allowLimitOrders ? `<label class="field"><span class="label">Limit price (${quoteUnit()})</span><input id="orderPrice" type="number" step="${contractFor().tickSize}" value="${Number(activeSide === "BUY" ? market.asks[0]?.[0] ?? market.ltp : market.bids[0]?.[0] ?? market.ltp).toFixed(quoteDigits())}"></label>` : ""}
         <p class="muted">${allowMarketOrders ? "Market buy fills at best ask, market sell fills at best bid. " : ""}${allowLimitOrders ? "Limit orders fill when LTP reaches the limit. " : ""}Brokerage ${whole(brokerage)} per lot.</p>
+        ${market.source === "shark-browser" ? `<p class="muted">Paper fills use this browser's live Shark quote. Keep the app open for pending limit orders.</p>` : ""}
         ${quoteUnit() === "USDT" ? `<p class="muted">Paper accounting: USDT price differences use the same number in your INR P&amp;L and balance, without an exchange-rate conversion.</p>` : ""}
         <button class="primary ${activeSide === "BUY" ? "buy" : "sell"}" type="submit">${activeSide} ${esc(contractFor().name)}</button>
       </form>
@@ -1577,6 +1590,9 @@ async function placeOrder(event) {
   if (type === "LIMIT" && !price) return notify("Enter a valid limit price.");
 
   try {
+    if (market.source === "shark-browser" && await relayBrowserSharkQuotes(selectedContractId) !== 1) {
+      return notify("A fresh Shark quote and order book are required to place this paper order.");
+    }
     await api("/api/orders", {
       method: "POST",
       body: JSON.stringify({ contractId: selectedContractId, side: activeSide, type, qty, price })

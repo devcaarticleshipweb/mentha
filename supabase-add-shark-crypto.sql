@@ -21,6 +21,7 @@ select proposed.* from (values
 ) as proposed(id, name, subtitle, instrument_key, lot_size, tick_size, initial_price, previous_close)
 where not exists (
   select 1 from public.contracts existing
-  where existing.instrument_key in (proposed.instrument_key, replace(proposed.instrument_key, 'SHARK:', ''))
+  where existing.id = proposed.id
+     or existing.instrument_key in (proposed.instrument_key, replace(proposed.instrument_key, 'SHARK:', ''))
 )
-on conflict (id) do nothing;
+on conflict do nothing;

@@ -142,6 +142,31 @@ function quoteFor(contract) {
   };
 }
 
+const browserSharkQuotes = new Map();
+function tradingQuoteFor(contract, userId) {
+  const serverQuote = quoteFor(contract);
+  if (serverQuote.source === "shark") return serverQuote;
+  const entry = browserSharkQuotes.get(`${userId}:${contract.id}`);
+  if (!entry || Date.now() - entry.receivedAt > 15000) return serverQuote;
+  return entry.quote;
+}
+
+function validBrowserSharkQuote(value, contract) {
+  if (value?.source !== "shark-browser" || value.instrumentKey !== contract.instrumentKey) return null;
+  const exchangeTime = Date.parse(value.timestamp);
+  if (!Number.isFinite(exchangeTime) || Math.abs(Date.now() - exchangeTime) > 15000) return null;
+  const ltp = Number(value.ltp);
+  if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 9999999999.9999) return null;
+  const levels = (rows, descending) => (Array.isArray(rows) ? rows : [])
+    .slice(0, 5).map((row) => [Number(row?.[0]), Number(row?.[1]), 0])
+    .filter(([price, qty]) => Number.isFinite(price) && price > 0 && price <= 9999999999.9999 && Number.isFinite(qty) && qty > 0)
+    .sort((a, b) => descending ? b[0] - a[0] : a[0] - b[0]);
+  const bids = levels(value.bids, true);
+  const asks = levels(value.asks, false);
+  if (!bids.length || !asks.length || bids[0][0] >= asks[0][0]) return null;
+  return { ltp, bids, asks, source: "shark-browser", instrumentKey: contract.instrumentKey, timestamp: value.timestamp };
+}
+
 function sharkPair(contract) {
   const match = /^SHARK:([A-Z0-9]+(?:INR|USDT))$/.exec(contract?.instrumentKey || "");
   return match?.[1] || null;
@@ -328,7 +353,8 @@ function executablePrice(order, quote) {
 let sharkSeedPromise;
 function ensureSharkContracts() {
   if (!sharkSeedPromise) sharkSeedPromise = (async () => {
-    const existing = await db(supabase.from("contracts").select("instrument_key"));
+    const existing = await db(supabase.from("contracts").select("id,instrument_key"));
+    const ids = new Set(existing.map((row) => String(row.id).toUpperCase()));
     const keys = new Set(existing.map((row) => String(row.instrument_key).toUpperCase()));
     const defaults = [
       ["BTCINR", "BITCOIN", 0.01], ["ETHINR", "ETHEREUM", 0.01],
@@ -336,13 +362,13 @@ function ensureSharkContracts() {
       ["BTCUSDT", "BITCOIN", 0.01], ["ETHUSDT", "ETHEREUM", 0.01],
       ["SOLUSDT", "SOLANA", 0.01], ["XRPUSDT", "XRP", 0.0001]
     ];
-    const missing = defaults.filter(([pair]) => !keys.has(pair) && !keys.has(`SHARK:${pair}`))
+    const missing = defaults.filter(([pair]) => !ids.has(`SHARK-${pair}`) && !keys.has(pair) && !keys.has(`SHARK:${pair}`))
       .map(([pair, name, tickSize]) => ({
         id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.replace(/(INR|USDT)$/, "/$1")}`,
         instrument_key: `SHARK:${pair}`, lot_size: 1, tick_size: tickSize,
         initial_price: 1, previous_close: 1, active: true
       }));
-    if (missing.length) await db(supabase.from("contracts").upsert(missing, { onConflict: "instrument_key", ignoreDuplicates: true }));
+    if (missing.length) await db(supabase.from("contracts").upsert(missing, { onConflict: "id", ignoreDuplicates: true }));
   })().catch((error) => {
     sharkSeedPromise = null;
     throw error;
@@ -420,8 +446,9 @@ async function marginSnapshot(userId) {
 async function fillOrder(order, forcedPrice = null) {
   const contract = contractsCache.find((item) => item.id === order.contract_id);
   if (!contract && forcedPrice === null) return order;
-  if (sharkPair(contract) && quoteFor(contract).source !== "shark" && forcedPrice === null) return order;
-  const fillPrice = forcedPrice ?? executablePrice(order, quoteFor(contract));
+  const quote = forcedPrice === null ? tradingQuoteFor(contract, order.user_id) : null;
+  if (sharkPair(contract) && !["shark", "shark-browser"].includes(quote?.source) && forcedPrice === null) return order;
+  const fillPrice = forcedPrice ?? executablePrice(order, quote);
   if (!fillPrice) return order;
   const user = await db(supabase.from("app_users").select("brokerage_per_lot").eq("id", order.user_id).single());
   const brokerage = Number(user.brokerage_per_lot || 0) * Number(order.qty || 0);
@@ -445,8 +472,10 @@ async function fillOrder(order, forcedPrice = null) {
   return updated;
 }
 
-async function matchOpenOrders() {
-  const orders = await db(supabase.from("orders").select("*").eq("status", "OPEN").limit(100));
+async function matchOpenOrders(userId = null) {
+  let query = supabase.from("orders").select("*").eq("status", "OPEN");
+  if (userId) query = query.eq("user_id", userId);
+  const orders = await db(query.limit(100));
   for (const order of orders) await fillOrder(order);
 }
 
@@ -669,6 +698,28 @@ app.get("/api/markets", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/api/shark/quotes", requireAuth, async (req, res) => {
+  try {
+    if (req.session.role !== "user") return res.status(403).json({ error: "Login as a trader to relay Shark quotes." });
+    const submitted = req.body.quotes;
+    if (!Array.isArray(submitted) || submitted.length > 16) return res.status(400).json({ error: "Invalid Shark quote batch." });
+    const contracts = contractsCache.length ? contractsCache : await loadContracts();
+    let accepted = 0;
+    for (const item of submitted) {
+      const contract = contracts.find((row) => row.id === item?.contractId && row.active && sharkPair(row));
+      if (!contract) continue;
+      const quote = validBrowserSharkQuote(item.quote, contract);
+      if (!quote) continue;
+      browserSharkQuotes.set(`${req.session.id}:${contract.id}`, { quote, receivedAt: Date.now() });
+      accepted++;
+    }
+    if (accepted) await matchOpenOrders(req.session.id);
+    res.json({ accepted });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.post("/api/contracts", requireAuth, requireMaster, async (req, res) => {
   try {
     const name = String(req.body.name || "").trim().toUpperCase();
@@ -840,7 +891,8 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     if (!["MARKET", "LIMIT"].includes(type)) return res.status(400).json({ error: "Invalid order type." });
     if (!qty || qty < 1) return res.status(400).json({ error: "Enter at least 1 lot." });
     if (type === "LIMIT" && !price) return res.status(400).json({ error: "Enter a valid limit price." });
-    if (sharkPair(contract) && (quoteFor(contract).source !== "shark" || (type === "MARKET" && (!quoteFor(contract).bids.length || !quoteFor(contract).asks.length)))) return res.status(503).json({ error: "Shark price or order book is unavailable for this pair." });
+    const tradingQuote = tradingQuoteFor(contract, req.session.id);
+    if (sharkPair(contract) && (!["shark", "shark-browser"].includes(tradingQuote.source) || (type === "MARKET" && (!tradingQuote.bids.length || !tradingQuote.asks.length)))) return res.status(503).json({ error: "A fresh Shark price and order book are required for this pair." });
 
     const margin = await marginSnapshot(req.session.id);
     if (!margin.user.active) return res.status(403).json({ error: "User is blocked." });
@@ -864,6 +916,10 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       status: "OPEN"
     }).select().single());
     const finalOrder = await fillOrder(order) || await db(supabase.from("orders").select("*").eq("id", order.id).single());
+    if (type === "MARKET" && finalOrder.status !== "FILLED") {
+      await db(supabase.from("orders").update({ status: "CANCELLED", cancelled_at: new Date().toISOString() }).eq("id", order.id).eq("status", "OPEN"));
+      return res.status(503).json({ error: "The Shark order book expired before this market order could fill. Try again with a fresh quote." });
+    }
     res.status(201).json({ order: publicOrder(finalOrder) });
   } catch (error) {
     res.status(400).json({ error: error.message });

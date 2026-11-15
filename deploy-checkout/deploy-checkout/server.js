@@ -309,13 +309,13 @@ function requireMaster(req, res, next) {
 }
 
 function roundTick(value, tick = 0.1) {
-  return Math.round(Number(value) / tick) * tick;
+  return Number((Math.round(Number(value) / tick) * tick).toFixed(4));
 }
 
 function validFillPrice(value) {
   const price = Number(value);
-  if (!Number.isFinite(price) || price <= 0 || price > 9999999999.99) return null;
-  return Math.round(price * 100) / 100 || null;
+  if (!Number.isFinite(price) || price <= 0 || price > 9999999999.9999) return null;
+  return Math.round(price * 10000) / 10000 || null;
 }
 
 function executablePrice(order, quote) {
@@ -331,13 +331,15 @@ function ensureSharkContracts() {
     const existing = await db(supabase.from("contracts").select("instrument_key"));
     const keys = new Set(existing.map((row) => String(row.instrument_key).toUpperCase()));
     const defaults = [
-      ["BTCINR", "BITCOIN"], ["ETHINR", "ETHEREUM"],
-      ["SOLINR", "SOLANA"], ["XRPINR", "XRP"]
+      ["BTCINR", "BITCOIN", 0.01], ["ETHINR", "ETHEREUM", 0.01],
+      ["SOLINR", "SOLANA", 0.01], ["XRPINR", "XRP", 0.01],
+      ["BTCUSDT", "BITCOIN", 0.01], ["ETHUSDT", "ETHEREUM", 0.01],
+      ["SOLUSDT", "SOLANA", 0.01], ["XRPUSDT", "XRP", 0.0001]
     ];
     const missing = defaults.filter(([pair]) => !keys.has(pair) && !keys.has(`SHARK:${pair}`))
-      .map(([pair, name]) => ({
-        id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.slice(0, -3)}/INR`,
-        instrument_key: `SHARK:${pair}`, lot_size: 1, tick_size: 0.01,
+      .map(([pair, name, tickSize]) => ({
+        id: `SHARK-${pair}`, name, subtitle: `SHARK ${pair.replace(/(INR|USDT)$/, "/$1")}`,
+        instrument_key: `SHARK:${pair}`, lot_size: 1, tick_size: tickSize,
         initial_price: 1, previous_close: 1, active: true
       }));
     if (missing.length) await db(supabase.from("contracts").upsert(missing, { onConflict: "instrument_key", ignoreDuplicates: true }));
@@ -679,7 +681,7 @@ app.post("/api/contracts", requireAuth, requireMaster, async (req, res) => {
     const previousClose = Number(req.body.previousClose);
     if (!name || name.length > 50 || !subtitle || subtitle.length > 60) return res.status(400).json({ error: "Enter a contract name and exchange/expiry." });
     if (!instrumentKey || instrumentKey.length > 150 || (instrumentKey.startsWith("SHARK:") && !/^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(instrumentKey))) return res.status(400).json({ error: "Enter an Upstox key or Shark pair as SHARK:BTCINR." });
-    if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.01 || Math.abs(tickSize * 100 - Math.round(tickSize * 100)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) return res.status(400).json({ error: "Enter valid lot size, tick size and prices." });
+    if (!Number.isInteger(lotSize) || lotSize < 1 || !Number.isFinite(tickSize) || tickSize < 0.0001 || Math.abs(tickSize * 10000 - Math.round(tickSize * 10000)) > 1e-8 || !Number.isFinite(initialPrice) || initialPrice <= 0 || !Number.isFinite(previousClose) || previousClose <= 0) return res.status(400).json({ error: "Enter valid lot size, tick size and prices." });
     const row = await db(supabase.from("contracts").insert({
       id: crypto.randomUUID(), name, subtitle, instrument_key: instrumentKey,
       lot_size: lotSize, tick_size: tickSize, initial_price: initialPrice,

@@ -70,16 +70,28 @@ const hostedContext = vm.createContext({
   clearInterval,
   setInterval
 });
-vm.runInContext(`${source}\n globalThis.feedTest = { startLocalSharkStream, quoteFor, watchlistTemplate, tradeTemplate };`, hostedContext);
+vm.runInContext(`${source}\n globalThis.feedTest = { startLocalSharkStream, quoteFor, watchlistTemplate, tradeTemplate, relayBrowserSharkQuotes };`, hostedContext);
 hostedContext.feedTest.startLocalSharkStream();
 const hostedSocket = sockets.at(-1);
 hostedSocket.onmessage({ data: '0{"sid":"test"}' });
 hostedSocket.onmessage({ data: '40{"sid":"test"}' });
 hostedSocket.onmessage({ data: `42${JSON.stringify(["24hrTicker", { s: "BTCINR", c: "6152773", p: "-428517", o: "6581291", h: "6600600", l: "6105652", w: "6342145", v: "100", Q: "0.131", E: Date.now() }])}` });
+hostedSocket.onmessage({ data: `42${JSON.stringify(["depthUpdate", { s: "BTCINR", b: [["6153000", "0.1"]], a: [["6154000", "0.3"]] }])}` });
 assert.equal(hostedContext.feedTest.quoteFor("SHARK-BTCINR").source, "shark-browser");
-assert.match(hostedContext.feedTest.watchlistTemplate(), /Shark live · view only/);
-vm.runInContext('selectedContractId = "SHARK-BTCINR"; market = quoteFor(selectedContractId);', hostedContext);
-assert.match(hostedContext.feedTest.tradeTemplate(null), /Paper orders are paused/);
+assert.match(hostedContext.feedTest.watchlistTemplate(), /Shark live · paper trading/);
+vm.runInContext('state.session = { role: "user", id: "TRADER1" }; selectedContractId = "SHARK-BTCINR"; market = quoteFor(selectedContractId);', hostedContext);
+assert.match(hostedContext.feedTest.tradeTemplate(null), /id="orderForm"/);
+let relayRequest;
+storage.set("mentha-session-token", "test-token");
+hostedContext.fetch = async (url, options) => {
+  relayRequest = { url, options };
+  return { ok: true, json: async () => ({ accepted: 1 }) };
+};
+assert.equal(await hostedContext.feedTest.relayBrowserSharkQuotes("SHARK-BTCINR"), 1);
+assert.equal(relayRequest.url, "/api/shark/quotes");
+assert.equal(JSON.parse(relayRequest.options.body).quotes[0].quote.source, "shark-browser");
+storage.delete("mentha-session-token");
+vm.runInContext("state.session = null;", hostedContext);
 hostedSocket.close();
 assert.equal(hostedContext.feedTest.quoteFor("SHARK-BTCINR").source, "pending");
 console.log("Shark hosted display fallback checks passed.");
@@ -125,3 +137,40 @@ assert.equal(serverContext.feedTest.markets.has("SHARK-BTCINR"), false);
 serverSocket.trigger("connect_error", { message: "blocked" });
 assert.match(serverContext.feedTest.streamError(), /blocked/);
 console.log("Shark server stream quote and disconnect checks passed.");
+
+let seeded;
+const seedContext = vm.createContext({
+  Set, String, Promise,
+  db: async (result) => result,
+  supabase: { from: () => ({
+    select: () => [{ id: "SHARK-BTCUSDT", instrument_key: "SHARK:OLD-BTCUSDT" }],
+    upsert: (rows, options) => { seeded = { rows, options }; return []; }
+  }) }
+});
+const seedMethods = serverSource.slice(serverSource.indexOf("let sharkSeedPromise;"), serverSource.indexOf("async function loadContracts"));
+vm.runInContext(`${seedMethods}\n globalThis.seedTest = ensureSharkContracts;`, seedContext);
+await seedContext.seedTest();
+assert.equal(seeded.rows.some((row) => row.id === "SHARK-BTCUSDT"), false);
+assert.equal(seeded.options.onConflict, "id");
+assert.equal(seeded.options.ignoreDuplicates, true);
+console.log("Shark contract seed primary-key collision check passed.");
+
+const relayContext = vm.createContext({
+  Date, Number, Array, Map,
+  quoteFor: () => ({ source: "pending" })
+});
+const relayMethods = serverSource.slice(serverSource.indexOf("const browserSharkQuotes"), serverSource.indexOf("function sharkPair"));
+vm.runInContext(`${relayMethods}\n globalThis.relayTest = { validBrowserSharkQuote, tradingQuoteFor, browserSharkQuotes };`, relayContext);
+const relayContract = { id: "SHARK-XRPUSDT", instrumentKey: "SHARK:XRPUSDT" };
+const relayQuote = {
+  source: "shark-browser", instrumentKey: "SHARK:XRPUSDT", timestamp: new Date().toISOString(),
+  ltp: 0.9026, bids: [[0.9025, 100]], asks: [[0.9027, 100]]
+};
+const acceptedQuote = relayContext.relayTest.validBrowserSharkQuote(relayQuote, relayContract);
+assert.equal(acceptedQuote.ltp, 0.9026);
+relayContext.relayTest.browserSharkQuotes.set("TRADER1:SHARK-XRPUSDT", { quote: acceptedQuote, receivedAt: Date.now() });
+assert.equal(relayContext.relayTest.tradingQuoteFor(relayContract, "TRADER1").source, "shark-browser");
+assert.equal(relayContext.relayTest.tradingQuoteFor(relayContract, "TRADER2").source, "pending");
+assert.equal(relayContext.relayTest.validBrowserSharkQuote({ ...relayQuote, timestamp: new Date(Date.now() - 30000).toISOString() }, relayContract), null);
+assert.equal(relayContext.relayTest.validBrowserSharkQuote({ ...relayQuote, bids: [[0.9030, 100]] }, relayContract), null);
+console.log("Shark browser relay freshness and account isolation checks passed.");

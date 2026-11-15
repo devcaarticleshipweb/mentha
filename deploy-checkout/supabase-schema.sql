@@ -37,7 +37,7 @@ values
   ('SHARK-ETHUSDT', 'ETHEREUM', 'SHARK ETH/USDT', 'SHARK:ETHUSDT', 1, 0.01, 1, 1),
   ('SHARK-SOLUSDT', 'SOLANA', 'SHARK SOL/USDT', 'SHARK:SOLUSDT', 1, 0.01, 1, 1),
   ('SHARK-XRPUSDT', 'XRP', 'SHARK XRP/USDT', 'SHARK:XRPUSDT', 1, 0.0001, 1, 1)
-on conflict (id) do nothing;
+on conflict do nothing;
 
 create table if not exists public.fund_ledger (
   id uuid primary key default gen_random_uuid(),

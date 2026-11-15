@@ -30,7 +30,7 @@ const context = vm.createContext({
   setInterval
 });
 const source = readFileSync(new URL("./app.js", import.meta.url), "utf8").replace(/bootstrap\(\);\s*$/, "");
-vm.runInContext(`${source}\n globalThis.feedTest = { startLocalSharkStream, quoteFor };`, context);
+vm.runInContext(`${source}\n globalThis.feedTest = { startLocalSharkStream, quoteFor, quotePrice, roundTick, positionReport, availableFunds };`, context);
 
 context.feedTest.startLocalSharkStream();
 assert.equal(sockets.length, 1);
@@ -40,6 +40,17 @@ socket.onmessage({ data: '0{"sid":"test"}' });
 socket.onmessage({ data: '40{"sid":"test"}' });
 assert.match(socket.sent[1], /btcinr@ticker/);
 assert.match(socket.sent[1], /btcinr@depth_0.1/);
+assert.match(socket.sent[1], /xrpusdt@ticker/);
+assert.match(socket.sent[1], /xrpusdt@depth_0.1/);
+assert.equal(context.feedTest.quotePrice(0.9026, "SHARK-XRPUSDT"), "0.9026 USDT");
+assert.equal(context.feedTest.roundTick(0.90263, 0.0001), 0.9026);
+assert.equal(context.feedTest.quotePrice(6152773, "SHARK-BTCINR"), "₹61,52,773.00");
+vm.runInContext(`state.trades = [
+  { userId: "TRADER1", contractId: "SHARK-XRPUSDT", side: "SELL", qty: 1, price: 1.9026, brokerage: 0 },
+  { userId: "TRADER1", contractId: "SHARK-XRPUSDT", side: "BUY", qty: 1, price: 0.9026, brokerage: 0 }
+];`, context);
+assert.equal(context.feedTest.positionReport("TRADER1", "SHARK-XRPUSDT").summary.realized, 1);
+assert.equal(context.feedTest.availableFunds("TRADER1"), 500001);
 socket.onmessage({ data: `42${JSON.stringify(["24hrTicker", { s: "BTCINR", c: "6152773", p: "-428517", o: "6581291", h: "6600600", l: "6105652", w: "6342145", v: "100", Q: "0.131", E: Date.now() }])}` });
 socket.onmessage({ data: `42${JSON.stringify(["depthUpdate", { s: "BTCINR", b: [["6153000", "0.1"], ["6153500", "0.2"]], a: [["6154000", "0.3"], ["6153900", "0.4"]] }])}` });
 const live = context.feedTest.quoteFor("SHARK-BTCINR");

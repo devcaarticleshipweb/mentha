@@ -76,7 +76,7 @@ Bitcoin, Ethereum, Solana, and XRP INR and USDT perpetual pairs use Shark Exchan
 
 Paper trading keeps balances, margin, brokerage, and P&L in INR. For USDT contracts, the app adds the numeric USDT price difference directly to INR P&L, with no exchange-rate conversion. For example, a 1 USDT gain on one unit adds ₹1. This is a deliberate paper-accounting rule, not an economic USD/INR valuation.
 
-If the Render server cannot reach Shark's stream, the browser displays Shark's public stream as a view-only quote. Paper orders remain paused until the server receives its own live quote. The `/health` endpoint reports `sharkStream` and each crypto pair's server quote source for diagnosis.
+If the Render server cannot reach Shark's stream, a logged-in trader's browser relays its live Shark quote and order book to the server for that trader's paper orders. The server accepts quotes for up to 15 seconds, and pending limit orders match while that trader has the app open. Browser-relayed quotes are client supplied and should only be used for this paper-trading app. The `/health` endpoint reports the server stream and each crypto pair's server quote source; `pending` there does not prevent browser-relayed paper trading.
 
 The PowerShell-only `?local=1` demo receives Shark quotes from its public WebSocket stream. Its non-crypto instruments are simulated. The watchlist labels each quote as Shark live, Upstox live, simulated, or feed unavailable. When Shark is unavailable, crypto paper orders pause until the feed returns.
 
