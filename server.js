@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
+import { io } from "socket.io-client";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,9 +20,6 @@ const POLL_MS = Number(process.env.MARKET_POLL_MS || 1500);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
-}
-if (typeof WebSocket !== "function") {
-  throw new Error("WebSocket support is required. Start with npm start (Node 20.10 or newer).");
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -193,9 +191,9 @@ function publishSharkQuote(pair) {
 }
 
 function subscribeSharkPairs(socket, pairs) {
-  if (socket.readyState !== WebSocket.OPEN || !pairs.length) return;
+  if (!socket.connected || !pairs.length) return;
   const topics = pairs.flatMap((pair) => [`${pair.toLowerCase()}@ticker`, `${pair.toLowerCase()}@depth_0.1`]);
-  socket.send(`42${JSON.stringify(["subscribe", { params: topics }])}`);
+  socket.emit("subscribe", { params: topics });
 }
 
 function ensureSharkStream(contracts) {
@@ -203,48 +201,43 @@ function ensureSharkStream(contracts) {
   if (!pairs.length) return;
   const previousPairs = sharkPairs;
   sharkPairs = pairs.join(",");
-  if (sharkSocket && sharkSocket.readyState < WebSocket.CLOSING) {
-    if (previousPairs !== sharkPairs && sharkSocket.readyState === WebSocket.OPEN) subscribeSharkPairs(sharkSocket, pairs);
+  if (sharkSocket) {
+    if (previousPairs !== sharkPairs) subscribeSharkPairs(sharkSocket, pairs);
     return;
   }
   sharkStreamError = "Connecting to Shark stream";
-  const socket = new WebSocket("wss://fawss.sharkexchange.in/socket.io/?EIO=4&transport=websocket");
+  const socket = io("https://fawss.sharkexchange.in/", {
+    transports: ["websocket", "polling"], tryAllTransports: true,
+    timeout: 8000, reconnectionDelay: 2000, reconnectionDelayMax: 10000
+  });
   sharkSocket = socket;
-  socket.onmessage = ({ data }) => {
-    if (socket !== sharkSocket) return;
-    const packet = String(data);
-    if (packet.startsWith("0")) socket.send("40");
-    else if (packet === "2") socket.send("3");
-    else if (packet.startsWith("40")) {
-      sharkStreamError = null;
-      subscribeSharkPairs(socket, sharkPairs.split(","));
-    } else if (packet.startsWith("42")) {
-      try {
-        const [event, payload] = JSON.parse(packet.slice(2));
-        const pair = payload?.s;
-        if (!sharkPairs.split(",").includes(pair)) return;
-        if (event === "24hrTicker") {
-          sharkTickers.set(pair, payload);
-          sharkTickAt.set(pair, Date.now());
-        } else if (event === "depthUpdate") {
-          sharkDepth.set(pair, { data: payload, receivedAt: Date.now() });
-        } else return;
-        publishSharkQuote(pair);
-      } catch (error) {
-        sharkStreamError = error.message;
-      }
-    }
-  };
-  socket.onclose = () => {
-    if (socket !== sharkSocket) return;
-    sharkSocket = null;
-    sharkStreamError = "Shark stream disconnected";
+  socket.on("connect", () => {
+    sharkStreamError = null;
+    subscribeSharkPairs(socket, sharkPairs.split(","));
+  });
+  socket.on("connect_error", (error) => {
+    sharkStreamError = `Shark stream connection failed: ${error.message}`;
+  });
+  socket.on("disconnect", (reason) => {
+    sharkStreamError = `Shark stream disconnected: ${reason}`;
     sharkTickers.clear();
     sharkDepth.clear();
     sharkTickAt.clear();
     for (const contract of contractsCache.filter(sharkPair)) markets.delete(contract.id);
-  };
-  socket.onerror = () => socket.close();
+  });
+  socket.on("24hrTicker", (payload) => {
+    const pair = payload?.s;
+    if (!sharkPairs.split(",").includes(pair)) return;
+    sharkTickers.set(pair, payload);
+    sharkTickAt.set(pair, Date.now());
+    publishSharkQuote(pair);
+  });
+  socket.on("depthUpdate", (payload) => {
+    const pair = payload?.s;
+    if (!sharkPairs.split(",").includes(pair)) return;
+    sharkDepth.set(pair, { data: payload, receivedAt: Date.now() });
+    publishSharkQuote(pair);
+  });
 }
 
 function publicOrder(row) {
@@ -937,7 +930,8 @@ app.get("/health", (req, res) => {
     return [sharkPair(contract), { source: quote.source, timestamp: quote.timestamp || null }];
   }));
   res.json({ ok: true, source: market.source, instrumentKey: UPSTOX_INSTRUMENT_KEY,
-    sharkStream: sharkSocket?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
+    sharkStream: sharkSocket?.connected ? "connected" : sharkSocket?.active ? "connecting" : "disconnected",
+    sharkTransport: sharkSocket?.connected ? sharkSocket.io.engine.transport.name : null,
     crypto, marketError: lastMarketError });
 });
 

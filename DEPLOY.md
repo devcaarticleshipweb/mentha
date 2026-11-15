@@ -72,7 +72,9 @@ Create users from the Admin tab. Users can then login from their own phone.
 
 The master-only Contracts tab adds instruments to every trader's Watchlist. Enter the instrument's Upstox key, lot size, tick size, and starting and previous-close prices. The starting prices are used when the Upstox token is unavailable. Traders can open a watchlist row to view its market depth and place paper orders for that contract.
 
-Bitcoin, Ethereum, Solana, and XRP INR perpetual pairs use Shark Exchange's public WebSocket ticker and depth stream. They need no Shark API key. Other supported INR or USDT pairs can be added in Contracts using an instrument key such as `SHARK:BNBINR` or `SHARK:BTCUSDT`. Shark quotes show as unavailable until a valid exchange response arrives; simulated prices are never used to fill Shark orders. The Node start command enables WebSocket support on Node 20.
+Bitcoin, Ethereum, Solana, and XRP INR perpetual pairs use Shark Exchange's public Socket.IO ticker and depth stream. They need no Shark API key. Other supported INR or USDT pairs can be added in Contracts using an instrument key such as `SHARK:BNBINR` or `SHARK:BTCUSDT`. Shark quotes show as unavailable until a valid exchange response arrives; simulated prices are never used to fill Shark orders.
+
+If the Render server cannot reach Shark's stream, the browser displays Shark's public stream as a view-only quote. Paper orders remain paused until the server receives its own live quote. The `/health` endpoint reports `sharkStream` and each crypto pair's server quote source for diagnosis.
 
 The PowerShell-only `?local=1` demo receives Shark quotes from its public WebSocket stream. Its non-crypto instruments are simulated. The watchlist labels each quote as Shark live, Upstox live, simulated, or feed unavailable. When Shark is unavailable, crypto paper orders pause until the feed returns.
 

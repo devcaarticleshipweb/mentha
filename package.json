@@ -4,14 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --experimental-websocket server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "socket.io-client": "4.8.4"
   },
   "engines": {
-    "node": ">=20.10 <25"
+    "node": ">=20 <25"
   }
 }

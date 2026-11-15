@@ -38,6 +38,7 @@ const seedState = {
 let state = structuredClone(seedState);
 let market = makeInitialMarket();
 let markets = { [DEFAULT_CONTRACT_ID]: market };
+const browserSharkMarkets = {};
 let selectedContractId = DEFAULT_CONTRACT_ID;
 let activeView = "watchlist";
 let activeSide = "BUY";
@@ -118,7 +119,9 @@ function initialQuote(contract) {
 }
 
 function quoteFor(id = selectedContractId) {
-  return markets[id] || initialQuote(contractFor(id));
+  const quote = markets[id] || initialQuote(contractFor(id));
+  if (!window.MENTHA_LOCAL_ONLY && quote.source !== "shark" && browserSharkMarkets[id]?.source === "shark-browser") return browserSharkMarkets[id];
+  return quote;
 }
 
 function saveLocalStore(db) {
@@ -724,12 +727,14 @@ const localSharkDepth = new Map();
 const localSharkTickAt = new Map();
 
 function localSharkContracts() {
-  return localStore().contracts.filter((item) => item.active && /^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(item.instrumentKey));
+  const contracts = window.MENTHA_LOCAL_ONLY ? localStore().contracts : state.contracts;
+  return contracts.filter((item) => item.active && /^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(item.instrumentKey));
 }
 
 function localSharkUnavailable(contracts, reason) {
   for (const contract of contracts) {
-    markets[contract.id] = { ...initialQuote(contract), error: reason };
+    if (window.MENTHA_LOCAL_ONLY) markets[contract.id] = { ...initialQuote(contract), error: reason };
+    else delete browserSharkMarkets[contract.id];
     localSharkTickAt.delete(contract.instrumentKey.slice(6));
   }
   market = quoteFor(selectedContractId);
@@ -748,29 +753,31 @@ function applyLocalSharkEvent(event, data) {
   const contract = localSharkContracts().find((item) => item.instrumentKey === `SHARK:${data?.s}`);
   if (!contract) return;
   const pair = data.s;
+  const target = window.MENTHA_LOCAL_ONLY ? markets : browserSharkMarkets;
+  const liveSource = window.MENTHA_LOCAL_ONLY ? "shark" : "shark-browser";
   if (event === "depthUpdate") {
     const depth = { bids: localSharkLevels(data.b, true), asks: localSharkLevels(data.a, false) };
     localSharkDepth.set(pair, depth);
-    if (markets[contract.id]?.source === "shark") markets[contract.id] = { ...markets[contract.id], ...depth };
+    if (target[contract.id]?.source === liveSource) target[contract.id] = { ...target[contract.id], ...depth };
   } else if (event === "24hrTicker") {
     const ltp = Number(data.c);
     if (!Number.isFinite(ltp) || ltp <= 0) return;
     const change = Number(data.p);
     const prevClose = ltp - (Number.isFinite(change) ? change : ltp - Number(data.o));
-    markets[contract.id] = {
+    target[contract.id] = {
       ltp, prevClose, open: Number(data.o) || ltp, high: Number(data.h) || ltp,
       low: Number(data.l) || ltp, avgPrice: Number(data.w) || ltp,
       netChange: ltp - prevClose, changePercent: prevClose ? (ltp - prevClose) / prevClose * 100 : 0,
       volume: Number(data.v) || 0, ltq: Number(data.Q) || 0,
       lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
       ...(localSharkDepth.get(pair) || { bids: [], asks: [] }),
-      source: "shark", instrumentKey: contract.instrumentKey,
+      source: liveSource, instrumentKey: contract.instrumentKey,
       timestamp: new Date(Number(data.E) || Date.now()).toISOString()
     };
     localSharkTickAt.set(pair, Date.now());
   } else return;
   market = quoteFor(selectedContractId);
-  localMatchOpenOrders();
+  if (window.MENTHA_LOCAL_ONLY) localMatchOpenOrders();
   if (state.session) renderIfNotEditing();
 }
 
@@ -824,6 +831,11 @@ function roundTick(value, tick = contractFor().tickSize) {
 
 function startRefresh() {
   clearInterval(refreshTimer);
+  if (!window.MENTHA_LOCAL_ONLY) {
+    startLocalSharkStream();
+    clearInterval(window.localSharkTimer);
+    window.localSharkTimer = setInterval(startLocalSharkStream, 5000);
+  }
   refreshTimer = setInterval(() => {
     refreshState(false).catch(() => {});
   }, 2500);
@@ -971,7 +983,7 @@ function watchlistTemplate() {
         const change = Number(quote.netChange ?? quote.ltp - quote.prevClose);
         const pct = Number(quote.changePercent ?? (quote.prevClose ? change / quote.prevClose * 100 : 0));
         return `<button class="watchlist-item" type="button" data-contract="${esc(contract.id)}">
-          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)} · ${quote.source === "shark" ? "Shark live" : quote.source === "pending" ? "Feed unavailable" : quote.source === "upstox" ? "Upstox live" : "Simulated"}</small></span>
+          <span class="watchlist-name"><strong>${esc(contract.name)}</strong><small>${esc(contract.subtitle)} · ${quote.source === "shark" ? "Shark live" : quote.source === "shark-browser" ? "Shark live · view only" : quote.source === "pending" ? "Feed unavailable" : quote.source === "upstox" ? "Upstox live" : "Simulated"}</small></span>
           <span class="watchlist-price"><strong class="${change >= 0 ? "up" : "down"}">${quote.source === "pending" ? "—" : fmt(quote.ltp, 2)}</strong><small>${quote.source === "pending" ? "Awaiting Shark" : `${signed(change)} (${Math.abs(pct).toFixed(2)}%)`}</small></span>
         </button>`;
       }).join("") : empty("No contracts available")}
@@ -1017,7 +1029,7 @@ function marketTemplate(pulse = false) {
   return `
     <section class="market-card ${pulse ? "pulse-board" : ""}">
       <div class="section-title-row">
-        <h2>Today's Market</h2><span class="chip">${market.source === "shark" ? "Shark live" : market.source === "pending" ? "Feed unavailable" : market.source === "upstox" ? "Upstox live" : "Simulated"}</span>
+        <h2>Today's Market</h2><span class="chip">${market.source === "shark" ? "Shark live" : market.source === "shark-browser" ? "Shark live · view only" : market.source === "pending" ? "Feed unavailable" : market.source === "upstox" ? "Upstox live" : "Simulated"}</span>
       </div>
       <div class="today-grid">
         <div><span>Open</span><strong>${fmt(market.open, 2)}</strong></div>
@@ -1107,6 +1119,9 @@ function tradeTemplate(pos) {
   const margin = Number(trader?.marginPerLot || 0);
   const allowMarketOrders = trader?.allowMarketOrders !== false;
   const allowLimitOrders = trader?.allowLimitOrders !== false;
+  if (market.source === "shark-browser") {
+    return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Live Shark prices are visible. Paper orders are paused until the server connects to Shark.</p></section>`;
+  }
   if (contractFor().instrumentKey?.startsWith("SHARK:") && market.source !== "shark") {
     return `<section class="panel"><h2>Order Ticket</h2><p class="muted">Shark price feed is unavailable${market.error ? `: ${esc(market.error)}` : ""}. Paper orders resume when live quotes return.</p></section>`;
   }

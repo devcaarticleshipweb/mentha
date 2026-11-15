@@ -1,0 +1,10 @@
+{
+  "name": "MENTHA Paper Trade",
+  "short_name": "MENTHA",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#090b10",
+  "theme_color": "#090b10",
+  "description": "Mobile-first paper trading app for MCX mentha oil practice trading.",
+  "icons": []
+}
