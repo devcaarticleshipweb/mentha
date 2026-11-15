@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node --experimental-websocket server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
@@ -12,6 +12,6 @@
     "express": "^4.19.2"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.10 <25"
   }
 }

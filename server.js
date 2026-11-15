@@ -20,6 +20,9 @@ const POLL_MS = Number(process.env.MARKET_POLL_MS || 1500);
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
 }
+if (typeof WebSocket !== "function") {
+  throw new Error("WebSocket support is required. Start with npm start (Node 20.10 or newer).");
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
@@ -56,6 +59,12 @@ const markets = new Map();
 let contractsCache = [];
 let lastMarketError = null;
 let cachedSettings = { brokeragePerLot: 0, marginPerLot: 0 };
+let sharkSocket = null;
+let sharkStreamError = null;
+let sharkPairs = "";
+const sharkTickers = new Map();
+const sharkDepth = new Map();
+const sharkTickAt = new Map();
 
 function base64url(input) {
   return Buffer.from(input).toString("base64url");
@@ -113,6 +122,8 @@ function publicContract(row) {
 
 function quoteFor(contract) {
   if (contract.id === "MENTHAOIL-OCT26") return markets.get(contract.id) || market;
+  const pair = sharkPair(contract);
+  if (pair && (!sharkTickAt.has(pair) || Date.now() - sharkTickAt.get(pair) > 15000)) markets.delete(contract.id);
   if (markets.has(contract.id)) return markets.get(contract.id);
   if (sharkPair(contract)) return {
     ...demoMarket, ltp: 0, prevClose: 0, open: 0, high: 0, low: 0,
@@ -166,20 +177,74 @@ function parseSharkQuote(ticker, depth, contract) {
   };
 }
 
-async function fetchSharkQuote(contract) {
-  const pair = sharkPair(contract);
-  const base = "https://api.sharkexchange.in/v1/market";
-  const [tickerResponse, depthResponse] = await Promise.all([
-    fetch(`${base}/ticker24Hr/${pair}`, { signal: AbortSignal.timeout(8000) }),
-    fetch(`${base}/depth/${pair}`, { signal: AbortSignal.timeout(8000) }).catch(() => null)
-  ]);
-  if (!tickerResponse.ok) {
-    const detail = (await tickerResponse.json().catch(() => null))?.message;
-    throw new Error(`Shark ${pair} HTTP ${tickerResponse.status}${detail ? `: ${detail}` : ""}`);
+function publishSharkQuote(pair) {
+  const ticker = sharkTickers.get(pair);
+  if (!ticker || Date.now() - (sharkTickAt.get(pair) || 0) > 15000) return;
+  const depthEntry = sharkDepth.get(pair);
+  const depth = depthEntry && Date.now() - depthEntry.receivedAt < 15000 ? depthEntry.data : null;
+  for (const contract of contractsCache.filter((item) => sharkPair(item) === pair)) {
+    try {
+      markets.set(contract.id, parseSharkQuote(ticker, depth, contract));
+    } catch (error) {
+      markets.delete(contract.id);
+      sharkStreamError = error.message;
+    }
   }
-  const ticker = (await tickerResponse.json()).data;
-  const depth = depthResponse?.ok ? (await depthResponse.json().catch(() => null))?.data : null;
-  return parseSharkQuote(ticker, depth, contract);
+}
+
+function subscribeSharkPairs(socket, pairs) {
+  if (socket.readyState !== WebSocket.OPEN || !pairs.length) return;
+  const topics = pairs.flatMap((pair) => [`${pair.toLowerCase()}@ticker`, `${pair.toLowerCase()}@depth_0.1`]);
+  socket.send(`42${JSON.stringify(["subscribe", { params: topics }])}`);
+}
+
+function ensureSharkStream(contracts) {
+  const pairs = [...new Set(contracts.map(sharkPair).filter(Boolean))].sort();
+  if (!pairs.length) return;
+  const previousPairs = sharkPairs;
+  sharkPairs = pairs.join(",");
+  if (sharkSocket && sharkSocket.readyState < WebSocket.CLOSING) {
+    if (previousPairs !== sharkPairs && sharkSocket.readyState === WebSocket.OPEN) subscribeSharkPairs(sharkSocket, pairs);
+    return;
+  }
+  sharkStreamError = "Connecting to Shark stream";
+  const socket = new WebSocket("wss://fawss.sharkexchange.in/socket.io/?EIO=4&transport=websocket");
+  sharkSocket = socket;
+  socket.onmessage = ({ data }) => {
+    if (socket !== sharkSocket) return;
+    const packet = String(data);
+    if (packet.startsWith("0")) socket.send("40");
+    else if (packet === "2") socket.send("3");
+    else if (packet.startsWith("40")) {
+      sharkStreamError = null;
+      subscribeSharkPairs(socket, sharkPairs.split(","));
+    } else if (packet.startsWith("42")) {
+      try {
+        const [event, payload] = JSON.parse(packet.slice(2));
+        const pair = payload?.s;
+        if (!sharkPairs.split(",").includes(pair)) return;
+        if (event === "24hrTicker") {
+          sharkTickers.set(pair, payload);
+          sharkTickAt.set(pair, Date.now());
+        } else if (event === "depthUpdate") {
+          sharkDepth.set(pair, { data: payload, receivedAt: Date.now() });
+        } else return;
+        publishSharkQuote(pair);
+      } catch (error) {
+        sharkStreamError = error.message;
+      }
+    }
+  };
+  socket.onclose = () => {
+    if (socket !== sharkSocket) return;
+    sharkSocket = null;
+    sharkStreamError = "Shark stream disconnected";
+    sharkTickers.clear();
+    sharkDepth.clear();
+    sharkTickAt.clear();
+    for (const contract of contractsCache.filter(sharkPair)) markets.delete(contract.id);
+  };
+  socket.onerror = () => socket.close();
 }
 
 function publicOrder(row) {
@@ -457,16 +522,10 @@ async function updateMarket() {
   const contracts = await loadContracts();
   const sharkContracts = contracts.filter(sharkPair);
   const upstoxContracts = contracts.filter((contract) => !sharkPair(contract));
-  const sharkResults = await Promise.allSettled(sharkContracts.map(fetchSharkQuote));
+  ensureSharkStream(sharkContracts);
   const errors = [];
-  sharkResults.forEach((result, index) => {
-    const contract = sharkContracts[index];
-    if (result.status === "fulfilled") markets.set(contract.id, result.value);
-    else {
-      markets.delete(contract.id);
-      errors.push(`${contract.name}: ${result.reason.message}`);
-    }
-  });
+  if (sharkStreamError) errors.push(sharkStreamError);
+  for (const contract of sharkContracts) quoteFor(contract);
   if (!UPSTOX_ACCESS_TOKEN) {
     for (const contract of upstoxContracts) {
       const current = quoteFor(contract);
@@ -873,7 +932,13 @@ app.post("/api/orders/:id/cancel", requireAuth, async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, source: market.source, instrumentKey: UPSTOX_INSTRUMENT_KEY, marketError: lastMarketError });
+  const crypto = Object.fromEntries(contractsCache.filter(sharkPair).map((contract) => {
+    const quote = quoteFor(contract);
+    return [sharkPair(contract), { source: quote.source, timestamp: quote.timestamp || null }];
+  }));
+  res.json({ ok: true, source: market.source, instrumentKey: UPSTOX_INSTRUMENT_KEY,
+    sharkStream: sharkSocket?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
+    crypto, marketError: lastMarketError });
 });
 
 app.get("*", (req, res) => {
