@@ -792,6 +792,8 @@ app.post("/api/users", requireAuth, requireMaster, async (req, res) => {
     if (!Number.isFinite(marginPerLot) || marginPerLot < 0) return res.status(400).json({ error: "Margin per lot must be zero or more." });
     if (typeof allowMarketOrders !== "boolean" || typeof allowLimitOrders !== "boolean") return res.status(400).json({ error: "Order permissions must be true or false." });
     if (id === "MASTER") return res.status(400).json({ error: "That user ID is reserved." });
+    const existingUser = await db(supabase.from("app_users").select("id").eq("id", id).maybeSingle());
+    if (existingUser) return res.status(409).json({ error: `User ID ${id} already exists. Choose another ID or check the Users list.` });
 
     const salt = crypto.randomBytes(16).toString("hex");
     const inserted = await db(supabase.from("app_users").insert({
@@ -806,12 +808,18 @@ app.post("/api/users", requireAuth, requireMaster, async (req, res) => {
       pin_hash: hashPin(pin, salt),
       active: true
     }).select().single());
-    await db(supabase.from("fund_ledger").insert({
-      user_id: id,
-      type: "OPENING",
-      amount: funds,
-      note: "Opening balance"
-    }));
+    try {
+      await db(supabase.from("fund_ledger").insert({
+        user_id: id,
+        type: "OPENING",
+        amount: funds,
+        note: "Opening balance"
+      }));
+    } catch (ledgerError) {
+      const rollback = await supabase.from("app_users").delete().eq("id", id);
+      if (rollback.error) throw new Error(`User ${id} was created, but opening balance history failed. Check the database before retrying: ${ledgerError.message}`);
+      throw new Error(`User was not created because opening balance history failed. Apply the latest Supabase schema: ${ledgerError.message}`);
+    }
     res.status(201).json({ user: publicUser(inserted) });
   } catch (error) {
     res.status(400).json({ error: error.message });

@@ -899,6 +899,7 @@ function isEditingField() {
 }
 
 function renderIfNotEditing() {
+  if (document.getElementById("userForm")?.dataset.dirty === "true") return;
   if (!isEditingField()) render();
 }
 
@@ -1254,7 +1255,7 @@ function adminTemplate() {
     </section>
     <section class="panel">
       <h2>Create User</h2>
-      <form class="trade-form" id="userForm">
+      <form class="trade-form" id="userForm" novalidate>
         <div class="form-grid">
           <label class="field"><span class="label">User ID</span><input id="newUserId" placeholder="TRADER2"></label>
           <label class="field"><span class="label">PIN</span><input id="newUserPin" placeholder="4 digits"></label>
@@ -1269,7 +1270,8 @@ function adminTemplate() {
           <label class="permission-option"><input id="newUserMarketOrders" type="checkbox" checked><span>Allow market orders</span></label>
           <label class="permission-option"><input id="newUserLimitOrders" type="checkbox" checked><span>Allow limit orders</span></label>
         </div>
-        <button class="secondary">Create user</button>
+        <button class="secondary" type="submit">Create user</button>
+        <p class="muted" id="userFormStatus" role="status" aria-live="polite"></p>
       </form>
     </section>
     <section class="panel">
@@ -1564,7 +1566,10 @@ function bindShell() {
   document.querySelectorAll("[data-cancel]").forEach((btn) => btn.addEventListener("click", () => cancelOrder(btn.dataset.cancel)));
   document.querySelectorAll("[data-manual-fill]").forEach((form) => form.addEventListener("submit", manualFillOrder));
   document.querySelectorAll("[data-edit-fill-price]").forEach((form) => form.addEventListener("submit", editOrderFillPrice));
-  document.getElementById("userForm")?.addEventListener("submit", createUser);
+  const userForm = document.getElementById("userForm");
+  userForm?.addEventListener("input", () => { userForm.dataset.dirty = "true"; });
+  userForm?.addEventListener("change", () => { userForm.dataset.dirty = "true"; });
+  userForm?.addEventListener("submit", createUser);
   document.getElementById("contractForm")?.addEventListener("submit", createContract);
   document.querySelectorAll("[data-contract-toggle]").forEach((btn) => btn.addEventListener("click", () => toggleContract(btn.dataset.contractToggle)));
   document.querySelectorAll("[data-toggle]").forEach((btn) => btn.addEventListener("click", () => toggleUser(btn.dataset.toggle)));
@@ -1643,23 +1648,42 @@ async function editOrderFillPrice(event) {
 
 async function createUser(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  const status = form.querySelector("#userFormStatus");
+  const button = form.querySelector('button[type="submit"]');
+  const showStatus = (message) => { if (status) status.textContent = message; };
   const id = document.getElementById("newUserId").value.trim().toUpperCase();
   const pin = document.getElementById("newUserPin").value.trim();
   const name = document.getElementById("newUserName").value.trim() || id;
-  const funds = Number(document.getElementById("newUserFunds").value);
-  const brokeragePerLot = Number(document.getElementById("newUserBrokerage").value);
-  const marginPerLot = Number(document.getElementById("newUserMargin").value);
+  const fundsInput = document.getElementById("newUserFunds").value.trim();
+  const brokerageInput = document.getElementById("newUserBrokerage").value.trim();
+  const marginInput = document.getElementById("newUserMargin").value.trim();
+  const funds = Number(fundsInput);
+  const brokeragePerLot = Number(brokerageInput);
+  const marginPerLot = Number(marginInput);
   const allowMarketOrders = document.getElementById("newUserMarketOrders").checked;
   const allowLimitOrders = document.getElementById("newUserLimitOrders").checked;
+  if (!/^[A-Z0-9_-]{3,20}$/.test(id)) return showStatus("User ID needs 3–20 letters, numbers, _ or -." );
+  if (pin.length < 4) return showStatus("PIN needs at least 4 characters.");
+  if (!fundsInput || !Number.isFinite(funds) || funds < 0) return showStatus("Enter valid opening funds of zero or more.");
+  if (!brokerageInput || !Number.isFinite(brokeragePerLot) || brokeragePerLot < 0) return showStatus("Enter valid brokerage of zero or more.");
+  if (!marginInput || !Number.isFinite(marginPerLot) || marginPerLot < 0) return showStatus("Enter valid margin of zero or more.");
+  button.disabled = true;
+  showStatus("Creating user…");
+  let created = false;
   try {
     await api("/api/users", {
       method: "POST",
       body: JSON.stringify({ id, pin, name, funds, brokeragePerLot, marginPerLot, allowMarketOrders, allowLimitOrders })
     });
-    await refreshState();
-    notify("User created.");
+    created = true;
+    form.dataset.dirty = "false";
+    await refreshState(false);
+    document.getElementById("userFormStatus").textContent = `User ${id} created.`;
   } catch (error) {
-    notify(error.message);
+    showStatus(created ? `User ${id} was created, but the list could not refresh: ${error.message}` : error.message);
+  } finally {
+    button.disabled = false;
   }
 }
 
