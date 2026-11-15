@@ -147,10 +147,12 @@ function parseSharkQuote(ticker, depth, contract) {
   const bids = (depth?.s === pair && Array.isArray(depth.b) ? depth.b : [])
     .map(([price, qty]) => [Number(price), Number(qty), 0])
     .filter(([price, qty]) => Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0)
+    .sort((a, b) => b[0] - a[0])
     .slice(0, 5);
   const asks = (depth?.s === pair && Array.isArray(depth.a) ? depth.a : [])
     .map(([price, qty]) => [Number(price), Number(qty), 0])
     .filter(([price, qty]) => Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0)
+    .sort((a, b) => a[0] - b[0])
     .slice(0, 5);
   const netChange = Number(ticker.p);
   const prevClose = ltp - (Number.isFinite(netChange) ? netChange : ltp - open);

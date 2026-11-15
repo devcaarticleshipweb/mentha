@@ -691,9 +691,9 @@ async function bootstrap() {
 
 function startLocalMarket() {
   clearInterval(localMarketTimer);
-  updateLocalSharkMarket();
+  startLocalSharkStream();
   clearInterval(window.localSharkTimer);
-  window.localSharkTimer = setInterval(updateLocalSharkMarket, 5000);
+  window.localSharkTimer = setInterval(startLocalSharkStream, 5000);
   localMarketTimer = setInterval(() => {
     for (const contract of localStore().contracts.filter((item) => item.active)) {
       if (contract.instrumentKey?.startsWith("SHARK:")) continue;
@@ -718,54 +718,104 @@ function startLocalMarket() {
   }, 1800);
 }
 
-let localSharkUpdating = false;
-async function updateLocalSharkMarket() {
-  if (localSharkUpdating) return;
-  localSharkUpdating = true;
-  try {
-    const contracts = localStore().contracts.filter((item) => item.active && /^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(item.instrumentKey));
-    await Promise.all(contracts.map(async (contract) => {
-      const pair = contract.instrumentKey.slice(6);
-      try {
-        const base = "https://api.sharkexchange.in/v1/market";
-        const [tickerResponse, depthResponse] = await Promise.all([
-          fetch(`${base}/ticker24Hr/${pair}`, { signal: AbortSignal.timeout(8000) }),
-          fetch(`${base}/depth/${pair}`, { signal: AbortSignal.timeout(8000) }).catch(() => null)
-        ]);
-        if (!tickerResponse.ok) {
-          const detail = (await tickerResponse.json().catch(() => null))?.message;
-          throw new Error(`Shark HTTP ${tickerResponse.status}${detail ? `: ${detail}` : ""}`);
-        }
-        const ticker = (await tickerResponse.json()).data;
-        if (ticker?.s !== pair || !Number.isFinite(Number(ticker.c)) || Number(ticker.c) <= 0) throw new Error("Invalid Shark ticker");
-        const depth = depthResponse?.ok ? (await depthResponse.json().catch(() => null))?.data : null;
-        const levels = (rows) => (Array.isArray(rows) ? rows : [])
-          .map(([price, qty]) => [Number(price), Number(qty), 0])
-          .filter(([price, qty]) => price > 0 && qty > 0).slice(0, 5);
-        const ltp = Number(ticker.c);
-        const change = Number(ticker.p);
-        const prevClose = ltp - (Number.isFinite(change) ? change : ltp - Number(ticker.o));
-        markets[contract.id] = {
-          ltp, prevClose, open: Number(ticker.o) || ltp, high: Number(ticker.h) || ltp,
-          low: Number(ticker.l) || ltp, avgPrice: Number(ticker.w) || ltp,
-          netChange: ltp - prevClose, changePercent: prevClose ? (ltp - prevClose) / prevClose * 100 : 0,
-          volume: Number(ticker.v) || 0, ltq: Number(ticker.Q) || 0,
-          lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
-          bids: depth?.s === pair ? levels(depth.b) : [],
-          asks: depth?.s === pair ? levels(depth.a) : [],
-          source: "shark", instrumentKey: contract.instrumentKey,
-          timestamp: new Date(Number(ticker.E) || Date.now()).toISOString()
-        };
-      } catch (error) {
-        markets[contract.id] = { ...initialQuote(contract), error: error.message };
-      }
-    }));
-    market = quoteFor(selectedContractId);
-    localMatchOpenOrders();
-    if (state.session) renderIfNotEditing();
-  } finally {
-    localSharkUpdating = false;
+let localSharkSocket = null;
+let localSharkPairs = "";
+const localSharkDepth = new Map();
+const localSharkTickAt = new Map();
+
+function localSharkContracts() {
+  return localStore().contracts.filter((item) => item.active && /^SHARK:[A-Z0-9]+(?:INR|USDT)$/.test(item.instrumentKey));
+}
+
+function localSharkUnavailable(contracts, reason) {
+  for (const contract of contracts) {
+    markets[contract.id] = { ...initialQuote(contract), error: reason };
+    localSharkTickAt.delete(contract.instrumentKey.slice(6));
   }
+  market = quoteFor(selectedContractId);
+  if (state.session) renderIfNotEditing();
+}
+
+function localSharkLevels(rows, descending) {
+  return (Array.isArray(rows) ? rows : [])
+    .map(([price, qty]) => [Number(price), Number(qty), 0])
+    .filter(([price, qty]) => price > 0 && qty > 0)
+    .sort((a, b) => descending ? b[0] - a[0] : a[0] - b[0])
+    .slice(0, 5);
+}
+
+function applyLocalSharkEvent(event, data) {
+  const contract = localSharkContracts().find((item) => item.instrumentKey === `SHARK:${data?.s}`);
+  if (!contract) return;
+  const pair = data.s;
+  if (event === "depthUpdate") {
+    const depth = { bids: localSharkLevels(data.b, true), asks: localSharkLevels(data.a, false) };
+    localSharkDepth.set(pair, depth);
+    if (markets[contract.id]?.source === "shark") markets[contract.id] = { ...markets[contract.id], ...depth };
+  } else if (event === "24hrTicker") {
+    const ltp = Number(data.c);
+    if (!Number.isFinite(ltp) || ltp <= 0) return;
+    const change = Number(data.p);
+    const prevClose = ltp - (Number.isFinite(change) ? change : ltp - Number(data.o));
+    markets[contract.id] = {
+      ltp, prevClose, open: Number(data.o) || ltp, high: Number(data.h) || ltp,
+      low: Number(data.l) || ltp, avgPrice: Number(data.w) || ltp,
+      netChange: ltp - prevClose, changePercent: prevClose ? (ltp - prevClose) / prevClose * 100 : 0,
+      volume: Number(data.v) || 0, ltq: Number(data.Q) || 0,
+      lowerCircuit: 0, upperCircuit: 0, oi: 0, previousOi: 0, oiChange: 0,
+      ...(localSharkDepth.get(pair) || { bids: [], asks: [] }),
+      source: "shark", instrumentKey: contract.instrumentKey,
+      timestamp: new Date(Number(data.E) || Date.now()).toISOString()
+    };
+    localSharkTickAt.set(pair, Date.now());
+  } else return;
+  market = quoteFor(selectedContractId);
+  localMatchOpenOrders();
+  if (state.session) renderIfNotEditing();
+}
+
+function startLocalSharkStream() {
+  const contracts = localSharkContracts();
+  const pairs = contracts.map((item) => item.instrumentKey.slice(6)).sort().join(",");
+  if (!pairs) return;
+  const stale = contracts.filter((item) => {
+    const lastTick = localSharkTickAt.get(item.instrumentKey.slice(6));
+    return lastTick && Date.now() - lastTick > 15000;
+  });
+  if (stale.length) {
+    localSharkUnavailable(stale, "Shark stream has stopped updating.");
+    localSharkSocket?.close();
+    return;
+  }
+  if (localSharkSocket && localSharkPairs === pairs && localSharkSocket.readyState < WebSocket.CLOSING) return;
+  if (localSharkSocket) localSharkSocket.close();
+  localSharkPairs = pairs;
+  localSharkDepth.clear();
+  localSharkUnavailable(contracts, "Connecting to Shark Exchange stream.");
+  const socket = new WebSocket("wss://fawss.sharkexchange.in/socket.io/?EIO=4&transport=websocket");
+  localSharkSocket = socket;
+  socket.onmessage = ({ data }) => {
+    if (socket !== localSharkSocket) return;
+    const packet = String(data);
+    if (packet.startsWith("0")) socket.send("40");
+    else if (packet === "2") socket.send("3");
+    else if (packet.startsWith("40")) {
+      const topics = pairs.split(",").flatMap((pair) => [`${pair.toLowerCase()}@ticker`, `${pair.toLowerCase()}@depth_0.1`]);
+      socket.send(`42${JSON.stringify(["subscribe", { params: topics }])}`);
+    } else if (packet.startsWith("42")) {
+      try {
+        const [event, payload] = JSON.parse(packet.slice(2));
+        applyLocalSharkEvent(event, payload);
+      } catch { /* Ignore malformed stream events. */ }
+    }
+  };
+  socket.onclose = () => {
+    if (socket !== localSharkSocket) return;
+    localSharkSocket = null;
+    localSharkDepth.clear();
+    localSharkUnavailable(contracts, "Shark stream disconnected. Reconnecting.");
+  };
+  socket.onerror = () => socket.close();
 }
 
 function roundTick(value, tick = contractFor().tickSize) {
